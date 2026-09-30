@@ -579,6 +579,34 @@ step_netcheck() {
     return 1
 }
 
+# Nikki 系统要求校验；返回 0 表示可安装
+nikki_requirements_ok() {
+    if [ "$FW4" -ne 1 ]; then
+        warn "Nikki 仅支持 firewall4 系统，不添加其源"
+        return 1
+    fi
+    case "$DISTRIB_RELEASE" in
+        *24.10*|*25.12*|SNAPSHOT) return 0 ;;
+        *)
+            warn "Nikki 要求 OpenWrt >= 24.10（当前: $DISTRIB_RELEASE），不添加其源"
+            return 1
+            ;;
+    esac
+}
+
+NIKKI_FEED_OK=0
+# 添加 Nikki 官方软件源（幂等，不刷新索引）；mirror 和 nikki 步骤共用
+ensure_nikki_feed() {
+    [ "$NIKKI_FEED_OK" -eq 1 ] && return 0
+    nikki_requirements_ok || return 1
+
+    info "添加 Nikki 官方软件源"
+    feed="$TMP_DIR/nikki-feed.sh"
+    dl_gh "$NIKKI_FEED" "$feed" || { err "feed.sh 下载失败"; return 1; }
+    sh "$feed" || { err "Nikki 软件源添加失败"; return 1; }
+    NIKKI_FEED_OK=1
+}
+
 step_mirror() {
     section "步骤 1/5 替换软件源为清华源"
 
@@ -599,6 +627,13 @@ step_mirror() {
     for f in $targets; do
         sanitize_repo_file "$f"
     done
+
+    # 清华源改完后立刻接入 Nikki 源，随后只更新一次索引即可覆盖两者
+    if ensure_nikki_feed; then
+        info "Nikki 源已就绪，将随清华源一起更新索引"
+    else
+        warn "Nikki 源本次未添加，nikki 步骤会单独重试"
+    fi
 
     info "更新软件索引"
     apk_update || { err "软件索引更新失败，可先手动执行 wget -O- $MIRROR_BASE/ 排查"; record_fail "mirror"; return 1; }
@@ -635,27 +670,15 @@ step_openclash() {
 step_nikki() {
     section "步骤 3/5 安装 Nikki"
     ensure_network || { err "网络未就绪，终止本步骤"; record_fail "nikki"; return 1; }
-    if [ "$FW4" -ne 1 ]; then
-        err "Nikki 仅支持 firewall4 系统，跳过"
+
+    if ! ensure_nikki_feed; then
+        err "Nikki 不满足安装条件或官方源添加失败"
         record_fail "nikki"
         return 1
     fi
-    case "$DISTRIB_RELEASE" in
-        *24.10*|*25.12*|SNAPSHOT) ;;
-        *)
-            err "Nikki 要求 OpenWrt >= 24.10（当前: $DISTRIB_RELEASE），跳过"
-            record_fail "nikki"
-            return 1
-            ;;
-    esac
 
-    info "添加 Nikki 官方软件源"
-    feed="$TMP_DIR/nikki-feed.sh"
-    dl_gh "$NIKKI_FEED" "$feed" || { err "feed.sh 下载失败"; record_fail "nikki"; return 1; }
-    sh "$feed" || { err "Nikki 软件源添加失败"; record_fail "nikki"; return 1; }
-
-    info "刷新软件索引（含 Nikki 新源）"
-    apk_update_force || { record_fail "nikki"; return 1; }
+    # 全量流程中 mirror 已带着 Nikki 源更新过索引；单独跑 nikki 时这里才真正更新
+    apk_update || { err "软件索引更新失败"; record_fail "nikki"; return 1; }
 
     info "安装 Nikki（自动解析依赖）"
     if is_installed luci-app-nikki && [ "$FORCE" != "1" ]; then

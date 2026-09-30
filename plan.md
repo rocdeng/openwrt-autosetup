@@ -38,9 +38,9 @@ OpenWrt 每次升级/刷机后，软件源和用户自行安装的软件都会�
 ```
 参数解析 → 环境校验 → 依次执行启用的步骤 → 结果汇总
                           │
-                          ├─ mirror     改源 + apk update
+                          ├─ mirror     改源 + 接入 Nikki feed + 单次 apk update
                           ├─ openclash  dnsmasq-full + GitHub apk
-                          ├─ nikki      feed.sh + apk add
+                          ├─ nikki      apk add（源与索引已在 mirror 就绪）
                           ├─ argon      GitHub apk ×2 + uci 设默认主题
                           └─ cert       apk add acme / ddns
 ```
@@ -71,7 +71,9 @@ DNS 失败时 `configure_dns` 将 DNS 列表（默认网关 + 223.5.5.5、119.29
   - 官方：`downloads.openwrt.org` / `archive.openwrt.org` → `mirrors.tuna.tsinghua.edu.cn/openwrt`
   - ImmortalWrt：对应域名 → `mirrors.tuna.tsinghua.edu.cn/immortalwrt`
 - 处理 apk 的源文件：`/etc/apk/repositories` 以及 `/etc/apk/repositories.d/*.list`。
-- 每个文件先备份到临时目录，再用 `sed -i` 原地替换；替换后 `apk update` 验证可用性。
+- 每个文件先备份到临时目录，再用 `sed -i` 原地替换。
+- 改完清华源后，通过共享函数 `ensure_nikki_feed`（校验 fw4/版本 → 下载执行 feed.sh）接入 Nikki 源，然后只执行**一次** `apk update` 同时覆盖清华源与 Nikki 源（需求：避免全量流程中 mirror 和 nikki 各更新一次）。
+- 若系统不满足 Nikki 条件或 feed 失败，mirror 不失败，只提示 nikki 步骤单独重试。
 
 ### 2. OpenClash（step_openclash）
 
@@ -82,11 +84,12 @@ DNS 失败时 `configure_dns` 将 DNS 列表（默认网关 + 223.5.5.5、119.29
 
 ### 3. Nikki（step_nikki）
 
-- 前置门槛（不满足则跳过并记录失败）：
+- 源接入逻辑已前置到 mirror（`ensure_nikki_feed`），本步骤复用；单独运行 `sh setup.sh nikki` 时仍会通过同一函数自动补源。
+- 前置门槛（不满足则记录失败）：
   - 必须是 firewall4/nftables 系统（存在 `/sbin/fw4`）；
   - 版本需 ≥ 24.10（白名单匹配 24.10 / 25.12 / SNAPSHOT）。
-- 下载并执行官方 `feed.sh`（自动适配 apk，写入 Nikki 软件源）。
-- `apk update` 后执行 `apk add nikki luci-app-nikki luci-i18n-nikki-zh-cn`，依赖由 apk 自动解决。
+- 全量流程中索引已由 mirror 带着 Nikki 源更新；单独跑 nikki 时才 `apk update`。
+- 然后执行 `apk add nikki luci-app-nikki luci-i18n-nikki-zh-cn`，依赖由 apk 自动解决。
 
 ### 4. Argon 主题与配置工具（step_argon）
 
