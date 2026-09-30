@@ -7,6 +7,8 @@ TMP_DIR="/tmp/openwrt-after-upgrade"
 LOG_FILE="$TMP_DIR/run.log"
 GITHUB_PROXY="${GITHUB_PROXY:-}"
 FORCE="${FORCE:-0}"
+GATEWAY="${GATEWAY:-192.168.1.1}"
+DNS_SERVERS="${DNS:-}"
 
 NIKKI_FEED="https://github.com/nikkinikki-org/OpenWrt-nikki/raw/refs/heads/main/feed.sh"
 
@@ -49,7 +51,7 @@ usage() {
 不指定步骤时执行全部步骤。要求系统使用 apk（OpenWrt 24.10+）。
 
 步骤:
-  netcheck    预检默认路由/IP 连通/DNS 解析（DNS 异常时自动配置）
+  netcheck    预检默认路由/IP 连通/DNS 解析（网关、DNS 异常时自动配置）
   mirror      替换 apk 源为清华源
   openclash   下载并安装 OpenClash apk
   nikki       添加 Nikki 源并安装
@@ -59,11 +61,15 @@ usage() {
 选项:
   -p, --proxy <URL>   指定单个 GitHub 加速前缀（默认已自动使用内置镜像）
       --direct        不走镜像，直连 GitHub
+  -g, --gateway <IP>  默认网关地址（默认 192.168.1.1）
+      --dns <IP>      DNS 服务器，可多次指定（默认：网关 + 公共 DNS）
   -h, --help          显示帮助
 
 环境变量:
   FORCE=1             已安装也重新安装
   GITHUB_PROXY=<URL>  同 --proxy
+  GATEWAY=<IP>        同 --gateway
+  DNS="<IP> ..."      同 --dns，空格分隔多个
 EOF
 }
 
@@ -76,6 +82,16 @@ while [ $# -gt 0 ]; do
             GITHUB_PROXY="${1#*=}"; shift ;;
         --direct)
             DIRECT=1; shift ;;
+        -g|--gateway)
+            [ $# -ge 2 ] || die "$1 需要一个 IP 参数"
+            GATEWAY="$2"; shift 2 ;;
+        --gateway=*)
+            GATEWAY="${1#*=}"; shift ;;
+        --dns)
+            [ $# -ge 2 ] || die "$1 需要一个 IP 参数"
+            DNS_SERVERS="${DNS_SERVERS:+$DNS_SERVERS }$2"; shift 2 ;;
+        --dns=*)
+            DNS_SERVERS="${DNS_SERVERS:+$DNS_SERVERS }${1#*=}"; shift ;;
         netcheck)  DO_NETCHECK=1; shift ;;
         mirror)    DO_MIRROR=1; shift ;;
         openclash) DO_OPENCLASH=1; shift ;;
@@ -342,7 +358,7 @@ sanitize_repo_file() {
 # ---- 网络分层预检：默认路由 -> IP 连通 -> DNS 解析 ----
 TEST_IP="223.5.5.5"
 TEST_HOST="www.baidu.com"
-FALLBACK_DNS="223.5.5.5 119.29.29.29"
+PUBLIC_DNS="223.5.5.5 119.29.29.29"
 
 has_default_route() {
     ip route show default 2>/dev/null | grep -q .
@@ -361,9 +377,10 @@ resolve_ok() {
 }
 
 configure_dns() {
-    info "自动配置 DNS：$FALLBACK_DNS"
+    list="${DNS_SERVERS:-$GATEWAY $PUBLIC_DNS}"
+    info "自动配置 DNS：$list"
     uci -q delete network.wan.dns 2>/dev/null
-    for d in $FALLBACK_DNS; do
+    for d in $list; do
         uci add_list network.wan.dns="$d" 2>/dev/null
     done
     uci commit network 2>/dev/null
@@ -371,18 +388,66 @@ configure_dns() {
     /etc/init.d/dnsmasq restart 2>/dev/null
 }
 
+# 取与目标地址直连的物理接口名
+route_dev_for() {
+    ip route get "$1" 2>/dev/null \
+        | sed -n 's/.* dev \([A-Za-z0-9_.-][A-Za-z0-9_.-]*\).*/\1/p' | head -n1
+}
+
+# 配置默认网关：立即生效 + 写入 UCI 持久化；返回 0 表示成功
+configure_gateway() {
+    info "配置默认网关：$GATEWAY"
+
+    if ip -4 addr show 2>/dev/null | grep -qw "$GATEWAY"; then
+        err "$GATEWAY 是本机接口地址，不能作为默认网关"
+        return 1
+    fi
+
+    if ! ping -c1 -W2 "$GATEWAY" >/dev/null 2>&1; then
+        err "网关 $GATEWAY 不可达：本机没有任何接口接入该网段"
+        info "请先确认 WAN 已接入上级网络（网线/DHCP/拨号），或用 --gateway 指定正确网关"
+        return 1
+    fi
+
+    ip route replace default via "$GATEWAY" || {
+        err "写入默认路由失败: default via $GATEWAY"
+        return 1
+    }
+
+    dev=$(route_dev_for "$GATEWAY")
+    ifname="wan"
+    [ -n "$dev" ] && [ "$dev" != "lo" ] && ifname="$dev"
+
+    # 命名 section，重复运行先删后加，避免产生多条重复静态路由
+    uci -q delete network.auto_defaultroute
+    uci set network.auto_defaultroute=route
+    uci set network.auto_defaultroute.interface="$ifname"
+    uci set network.auto_defaultroute.target='0.0.0.0'
+    uci set network.auto_defaultroute.netmask='0.0.0.0'
+    uci set network.auto_defaultroute.gateway="$GATEWAY"
+    uci commit network
+    info "默认网关已生效并持久化（interface=$ifname）"
+}
+
 # 预检并尽力修复；返回 0 表示已可正常解析上网
 preflight_network() {
+    if ! has_default_route || ! ip_reachable; then
+        warn "默认路由缺失或外网 IP 不可达，尝试自动配置默认网关"
+        if ! configure_gateway; then
+            info "请检查 WAN 口网线、光猫地址、DHCP/PPPoE 配置后重跑: sh $0 netcheck"
+            return 1
+        fi
+    fi
+
     if ! has_default_route; then
-        err "未检测到默认路由，WAN 可能未连接/未拨号"
-        info "请检查 WAN 口网线、DHCP/PPPoE 配置后重跑: sh $0 netcheck"
+        err "配置后仍无默认路由"
         return 1
     fi
     info "默认路由正常"
 
     if ! ip_reachable; then
-        err "无法 ping 通 $TEST_IP，WAN 链路未真正连通（与 DNS 无关）"
-        info "请确认 WAN 已获取地址或完成拨号后重跑: sh $0 netcheck"
+        err "默认网关已配置但仍无法 ping 通 $TEST_IP，网关上游可能无法访问外网"
+        info "请检查网关设备本身的联网，或指定其他网关: sh $0 netcheck --gateway <IP>"
         return 1
     fi
     info "IP 连通正常（$TEST_IP 可达）"
@@ -409,7 +474,7 @@ preflight_network() {
     err "配置 DNS 后仍无法解析域名"
     info "当前 /etc/resolv.conf:"; cat /etc/resolv.conf 2>/dev/null | tee -a "$LOG_FILE"
     info "上游 DNS 记录:"; cat /tmp/resolv.conf.d/resolv.conf.auto 2>/dev/null | tee -a "$LOG_FILE"
-    err "可手动排查: nslookup $TEST_HOST $TEST_IP，或检查上游是否拦截 53 端口"
+    err "可手动排查: nslookup $TEST_HOST $GATEWAY，或检查上游是否拦截 53 端口"
     return 1
 }
 

@@ -49,13 +49,17 @@ OpenWrt 每次升级/刷机后，软件源和用户自行安装的软件都会�
 
 ### 0. 网络与 DNS 预检（step_netcheck）
 
-所有安装动作都依赖网络，因此把网络检查独立成步、并在每个联网步骤前复用。`preflight_network` 按三层逐级判定，快速区分「WAN 没连上」与「DNS 没配」：
+所有安装动作都依赖网络，因此把网络检查独立成步、并在每个联网步骤前复用。`preflight_network` 逐级判定，先修链路、再修解析：
 
-1. **默认路由**：`ip route show default` 非空，否则提示检查 WAN 网线 / DHCP / PPPoE；
-2. **IP 连通**：`ping 223.5.5.5`，不通说明链路本身未连通（与 DNS 无关）；
+1. **默认路由 / IP 连通**：`ip route show default` 缺失或 `ping 223.5.5.5` 不通时，调用 `configure_gateway` 自动修复：
+   - 网关地址默认 `192.168.1.1`，可用 `--gateway`（或 `GATEWAY` 环境变量）覆盖；
+   - 安全校验：拒绝把本机接口地址设为网关；先 ping 网关确认本机已接入该网段，不可达则放弃（避免写入无效路由）；
+   - `ip route replace default via <网关>` 立即生效，并以命名 section `auto_defaultroute` 写入 UCI 静态路由（重复运行先删后加），接口名通过 `ip route get` 自动探测，失败回退 `wan`；
+   - 配置后仍 ping 不通外网，判定为网关上游问题并提示更换网关；
+2. **IP 连通**：`ping 223.5.5.5`，确认链路层已通；
 3. **DNS 解析**：`nslookup www.baidu.com`（无 nslookup 时退化为 ping 域名）。
 
-DNS 失败时 `configure_dns` 自动写入公共 DNS（223.5.5.5、119.29.29.29）到 `network.wan.dns`，重启 WAN 与 dnsmasq，随后最多重试 6 次等待生效；仍失败则打印 `/etc/resolv.conf` 与上游 DNS 记录辅助排查。
+DNS 失败时 `configure_dns` 自动写入 DNS 列表（默认网关 + 223.5.5.5、119.29.29.29，可用 `--dns` 多次指定或 `DNS` 环境变量覆盖）到 `network.wan.dns`，重启 WAN 与 dnsmasq，随后最多重试 6 次等待生效；仍失败则打印 `/etc/resolv.conf` 与上游 DNS 记录辅助排查。
 
 > 顺序约束：mirror 步骤改为**先预检通过、再改源文件**，避免在无网状态下先污染配置。
 
@@ -128,8 +132,9 @@ DNS 失败时 `configure_dns` 自动写入公共 DNS（223.5.5.5、119.29.29.29�
 chmod +x setup.sh
 
 sh setup.sh                       # 执行全部步骤（含最先执行的网络预检）
-sh setup.sh netcheck              # 只做网络与 DNS 预检（异常时自动配置 DNS）
+sh setup.sh netcheck              # 只做网络与 DNS 预检（网关、DNS 异常时自动配置）
 sh setup.sh mirror openclash      # 只执行指定步骤
+sh setup.sh netcheck --gateway 192.168.0.1   # 指定上级网关（默认 192.168.1.1）
 sh setup.sh -p https://ghproxy.net/   # GitHub 受限时配置加速前缀
 
 FORCE=1 sh setup.sh argon         # 已安装也强制重装
