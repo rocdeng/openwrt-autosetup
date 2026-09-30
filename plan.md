@@ -54,12 +54,12 @@ OpenWrt 每次升级/刷机后，软件源和用户自行安装的软件都会�
 1. **默认路由 / IP 连通**：`ip route show default` 缺失或 `ping 223.5.5.5` 不通时，调用 `configure_gateway` 自动修复：
    - 网关地址默认 `192.168.1.1`，可用 `--gateway`（或 `GATEWAY` 环境变量）覆盖；
    - 安全校验：拒绝把本机接口地址设为网关；先 ping 网关确认本机已接入该网段，不可达则放弃（避免写入无效路由）；
-   - `ip route replace default via <网关>` 立即生效，并以命名 section `auto_defaultroute` 写入 UCI 静态路由（重复运行先删后加），接口名通过 `ip route get` 自动探测，失败回退 `wan`；
+   - `ip route replace default via <网关>` 立即生效，并以命名 section `auto_defaultroute` 写入 UCI 静态路由（重复运行先删后加）；逻辑接口名不再写死 `wan`：先由 `ip route get` 取物理设备（如 `br-lan`），再遍历 `uci show network` 按 device 反查逻辑接口（如 `lan`），PPPoE（设备 `pppoe-*`）按 `proto ppp*` 回退匹配，全部失败才回退 `lan`；
    - 配置后仍 ping 不通外网，判定为网关上游问题并提示更换网关；
 2. **IP 连通**：`ping 223.5.5.5`，确认链路层已通；
 3. **DNS 解析**：`nslookup www.baidu.com`（无 nslookup 时退化为 ping 域名）。
 
-DNS 失败时 `configure_dns` 自动写入 DNS 列表（默认网关 + 223.5.5.5、119.29.29.29，可用 `--dns` 多次指定或 `DNS` 环境变量覆盖）到 `network.wan.dns`，重启 WAN 与 dnsmasq，随后最多重试 6 次等待生效；仍失败则打印 `/etc/resolv.conf` 与上游 DNS 记录辅助排查。
+DNS 失败时 `configure_dns` 将 DNS 列表（默认网关 + 223.5.5.5、119.29.29.29，可用 `--dns` 多次指定或 `DNS` 环境变量覆盖）写入**自动探测到的上联逻辑接口**（`network.<iface>.dns`，实测设备为 `lan`），软重载该接口（`ifup <iface>`）并重启 dnsmasq，随后最多重试 6 次等待生效；仍失败则打印 `/etc/resolv.conf` 与上游 DNS 记录辅助排查。
 
 > 顺序约束：mirror 步骤改为**先预检通过、再改源文件**，避免在无网状态下先污染配置。
 

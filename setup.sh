@@ -378,20 +378,58 @@ resolve_ok() {
 
 configure_dns() {
     list="${DNS_SERVERS:-$GATEWAY $PUBLIC_DNS}"
-    info "自动配置 DNS：$list"
-    uci -q delete network.wan.dns 2>/dev/null
+    iface=$(detect_uplink)
+    info "自动配置 DNS（接口 $iface）：$list"
+    uci -q delete "network.$iface.dns" 2>/dev/null
     for d in $list; do
-        uci add_list network.wan.dns="$d" 2>/dev/null
+        uci add_list "network.$iface.dns=$d" 2>/dev/null
     done
     uci commit network 2>/dev/null
-    ifdown wan 2>/dev/null; ifup wan 2>/dev/null
+    # 只做软重载（ifup 不先 ifdown），减少对登录会话/WiFi 的影响
+    ifup "$iface" 2>/dev/null
     /etc/init.d/dnsmasq restart 2>/dev/null
 }
 
-# 取与目标地址直连的物理接口名
+# 取与目标地址直连的物理设备名（br-lan / eth1 / pppoe-wan ...）
 route_dev_for() {
     ip route get "$1" 2>/dev/null \
         | sed -n 's/.* dev \([A-Za-z0-9_.-][A-Za-z0-9_.-]*\).*/\1/p' | head -n1
+}
+
+# 上联逻辑接口名（lan/wan/...），全局只解析一次
+# 路由/接口配置的 interface 字段必须是 UCI 逻辑接口名，不能假定叫 wan，
+# 也不能直接填物理设备名（否则 netifd 报 "Interface xxx not found"）
+UPLINK_IFACE=""
+detect_uplink() {
+    [ -n "$UPLINK_IFACE" ] && { printf '%s' "$UPLINK_IFACE"; return 0; }
+
+    dev=$(route_dev_for "$GATEWAY")
+    name=""
+
+    if command -v uci >/dev/null 2>&1; then
+        sections=$(uci show network 2>/dev/null \
+            | sed -n 's/^network\.\([^.=]*\)=interface$/\1/p')
+        # 优先按物理设备精确匹配
+        for s in $sections; do
+            d=$(uci -q get "network.$s.device" 2>/dev/null)
+            [ -z "$d" ] && d=$(uci -q get "network.$s.ifname" 2>/dev/null)
+            case " $d " in
+                *" $dev "*) name="$s"; break ;;
+            esac
+        done
+        # PPPoE 路由设备为 pppoe-<iface>，与 UCI 的 device 不一致：按 ppp 协议匹配
+        if [ -z "$name" ] && printf '%s' "$dev" | grep -q '^ppp'; then
+            for s in $sections; do
+                proto=$(uci -q get "network.$s.proto" 2>/dev/null)
+                case "$proto" in ppp*) name="$s"; break ;; esac
+            done
+        fi
+    fi
+
+    [ -z "$name" ] && name="$dev"
+    [ -z "$name" ] && name="lan"
+    UPLINK_IFACE="$name"
+    printf '%s' "$name"
 }
 
 # 配置默认网关：立即生效 + 写入 UCI 持久化；返回 0 表示成功
@@ -405,7 +443,7 @@ configure_gateway() {
 
     if ! ping -c1 -W2 "$GATEWAY" >/dev/null 2>&1; then
         err "网关 $GATEWAY 不可达：本机没有任何接口接入该网段"
-        info "请先确认 WAN 已接入上级网络（网线/DHCP/拨号），或用 --gateway 指定正确网关"
+        info "请先确认上联接口已接入上级网络（网线/DHCP/拨号），或用 --gateway 指定正确网关"
         return 1
     fi
 
@@ -414,9 +452,7 @@ configure_gateway() {
         return 1
     }
 
-    dev=$(route_dev_for "$GATEWAY")
-    ifname="wan"
-    [ -n "$dev" ] && [ "$dev" != "lo" ] && ifname="$dev"
+    ifname=$(detect_uplink)
 
     # 命名 section，重复运行先删后加，避免产生多条重复静态路由
     uci -q delete network.auto_defaultroute
@@ -434,7 +470,7 @@ preflight_network() {
     if ! has_default_route || ! ip_reachable; then
         warn "默认路由缺失或外网 IP 不可达，尝试自动配置默认网关"
         if ! configure_gateway; then
-            info "请检查 WAN 口网线、光猫地址、DHCP/PPPoE 配置后重跑: sh $0 netcheck"
+            info "请检查上联接口的网线、上级设备地址、DHCP/PPPoE 配置后重跑: sh $0 netcheck"
             return 1
         fi
     fi
