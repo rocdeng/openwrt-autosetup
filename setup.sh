@@ -376,6 +376,7 @@ resolve_ok() {
     fi
 }
 
+# 仅写入 DNS 配置（UCI），不重载接口；由 preflight 统一 reload 一次
 configure_dns() {
     list="${DNS_SERVERS:-$GATEWAY $PUBLIC_DNS}"
     iface=$(detect_uplink)
@@ -385,9 +386,6 @@ configure_dns() {
         uci add_list "network.$iface.dns=$d" 2>/dev/null
     done
     uci commit network 2>/dev/null
-    # 只做软重载（ifup 不先 ifdown），减少对登录会话/WiFi 的影响
-    ifup "$iface" 2>/dev/null
-    /etc/init.d/dnsmasq restart 2>/dev/null
 }
 
 # 取与目标地址直连的物理设备名（br-lan / eth1 / pppoe-wan ...）
@@ -426,13 +424,23 @@ detect_uplink() {
         fi
     fi
 
-    [ -z "$name" ] && name="$dev"
+    # 仍未命中：取第一个非 loopback 逻辑接口。
+    # 不能回退成物理设备名——它不是合法的 network section 名，写入会被静默丢弃
+    if [ -z "$name" ]; then
+        for s in $sections; do
+            [ "$s" = "loopback" ] && continue
+            d=$(uci -q get "network.$s.device" 2>/dev/null)
+            [ "$d" = "lo" ] && continue
+            name="$s"; break
+        done
+    fi
+
     [ -z "$name" ] && name="lan"
     UPLINK_IFACE="$name"
     printf '%s' "$name"
 }
 
-# 配置默认网关：立即生效 + 写入 UCI 持久化；返回 0 表示成功
+# 配置默认网关：按接口协议选择持久化方式，并立即下发内核路由
 configure_gateway() {
     info "配置默认网关：$GATEWAY"
 
@@ -447,22 +455,53 @@ configure_gateway() {
         return 1
     fi
 
+    ifname=$(detect_uplink)
+    proto=$(uci -q get "network.$ifname.proto" 2>/dev/null)
+
+    # 上一版遗留的静态路由 section，先清理，避免两种方式并存
+    uci -q delete network.auto_defaultroute
+
+    case "$proto" in
+        static|"")
+            # 静态地址接口：gateway 是接口原生选项，ifup 后 netifd 自动重建默认路由，
+            # 比独立 route section 可靠（route section 在接口重载瞬间可能漏装）
+            uci set "network.$ifname.gateway=$GATEWAY"
+            info "网关写入接口配置 network.$ifname.gateway（静态地址，netifd 原生管理）"
+            ;;
+        *)
+            # DHCP/PPPoE 等接口忽略 gateway 选项，用静态默认路由 section
+            uci set network.auto_defaultroute=route
+            uci set network.auto_defaultroute.interface="$ifname"
+            uci set network.auto_defaultroute.target='0.0.0.0'
+            uci set network.auto_defaultroute.netmask='0.0.0.0'
+            uci set network.auto_defaultroute.gateway="$GATEWAY"
+            info "网关以静态路由 section 写入（$proto 接口，interface=$ifname）"
+            ;;
+    esac
+    uci commit network
+
+    # 立即生效，不必等接口重载
     ip route replace default via "$GATEWAY" || {
         err "写入默认路由失败: default via $GATEWAY"
         return 1
     }
+}
 
-    ifname=$(detect_uplink)
+# 重载上联接口（网关/DNS 共用一次），等待网关重新可达并兜底补回内核默认路由
+reload_uplink() {
+    iface=$(detect_uplink)
+    info "重载上联接口 $iface 使配置生效"
+    ifup "$iface" 2>/dev/null
 
-    # 命名 section，重复运行先删后加，避免产生多条重复静态路由
-    uci -q delete network.auto_defaultroute
-    uci set network.auto_defaultroute=route
-    uci set network.auto_defaultroute.interface="$ifname"
-    uci set network.auto_defaultroute.target='0.0.0.0'
-    uci set network.auto_defaultroute.netmask='0.0.0.0'
-    uci set network.auto_defaultroute.gateway="$GATEWAY"
-    uci commit network
-    info "默认网关已生效并持久化（interface=$ifname）"
+    i=1
+    while [ "$i" -le 15 ]; do
+        ping -c1 -W1 "$GATEWAY" >/dev/null 2>&1 && break
+        sleep 1
+        i=$((i + 1))
+    done
+
+    # netifd 重载会清空旧内核路由；原生 gateway 应由其重建，route section 可能滞后，统一兜底
+    has_default_route || ip route replace default via "$GATEWAY" 2>/dev/null
 }
 
 # 预检并尽力修复；返回 0 表示已可正常解析上网
@@ -495,6 +534,13 @@ preflight_network() {
 
     warn "DNS 解析失败"
     configure_dns
+    reload_uplink
+    /etc/init.d/dnsmasq restart 2>/dev/null
+
+    if ! has_default_route; then
+        err "接口重载后默认路由丢失且未能恢复"
+        return 1
+    fi
 
     i=1
     while [ "$i" -le 6 ]; do

@@ -54,12 +54,14 @@ OpenWrt 每次升级/刷机后，软件源和用户自行安装的软件都会�
 1. **默认路由 / IP 连通**：`ip route show default` 缺失或 `ping 223.5.5.5` 不通时，调用 `configure_gateway` 自动修复：
    - 网关地址默认 `192.168.1.1`，可用 `--gateway`（或 `GATEWAY` 环境变量）覆盖；
    - 安全校验：拒绝把本机接口地址设为网关；先 ping 网关确认本机已接入该网段，不可达则放弃（避免写入无效路由）；
-   - `ip route replace default via <网关>` 立即生效，并以命名 section `auto_defaultroute` 写入 UCI 静态路由（重复运行先删后加）；逻辑接口名不再写死 `wan`：先由 `ip route get` 取物理设备（如 `br-lan`），再遍历 `uci show network` 按 device 反查逻辑接口（如 `lan`），PPPoE（设备 `pppoe-*`）按 `proto ppp*` 回退匹配，全部失败才回退 `lan`；
+   - 逻辑接口名自动探测：`ip route get` 取物理设备（如 `br-lan`）→ 遍历 `uci show network` 按 device 反查逻辑接口（如 `lan`）；PPPoE（设备 `pppoe-*`）按 `proto ppp*` 匹配；都不命中则取第一个非 loopback 逻辑接口（**禁止回退物理设备名**，否则 UCI 写入被静默丢弃）；
+   - 持久化方式按协议选择：`static` 接口直接写 `network.<iface>.gateway`（netifd 原生管理，重载后自动重建；旧版独立 `route` section 会在 ifup 瞬间漏装）；`dhcp`/`ppp*` 接口忽略 gateway 选项，用命名 section `auto_defaultroute`，配置前先清理旧 section；
+   - 网关与 DNS 只触发**一次** `ifup <iface>`；重载后等待网关可达（最多 15 秒），并校验/兜底补回内核默认路由，避免重载清空路由后失联；
    - 配置后仍 ping 不通外网，判定为网关上游问题并提示更换网关；
 2. **IP 连通**：`ping 223.5.5.5`，确认链路层已通；
 3. **DNS 解析**：`nslookup www.baidu.com`（无 nslookup 时退化为 ping 域名）。
 
-DNS 失败时 `configure_dns` 将 DNS 列表（默认网关 + 223.5.5.5、119.29.29.29，可用 `--dns` 多次指定或 `DNS` 环境变量覆盖）写入**自动探测到的上联逻辑接口**（`network.<iface>.dns`，实测设备为 `lan`），软重载该接口（`ifup <iface>`）并重启 dnsmasq，随后最多重试 6 次等待生效；仍失败则打印 `/etc/resolv.conf` 与上游 DNS 记录辅助排查。
+DNS 失败时 `configure_dns` 将 DNS 列表（默认网关 + 223.5.5.5、119.29.29.29，可用 `--dns` 多次指定或 `DNS` 环境变量覆盖）写入自动探测到的上联逻辑接口（`network.<iface>.dns`，实测设备为 `lan`）；DNS 与网关共用同一次 `ifup <iface>`，随后重启 dnsmasq 并最多重试 6 次等待生效；仍失败则打印 `/etc/resolv.conf` 与上游 DNS 记录辅助排查。
 
 > 顺序约束：mirror 步骤改为**先预检通过、再改源文件**，避免在无网状态下先污染配置。
 
