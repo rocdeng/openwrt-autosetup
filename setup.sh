@@ -14,6 +14,7 @@ DNS_SERVERS="${DNS:-}"
 CONF_DIR="/etc/autosetup"
 PKG_SNAPSHOT="$CONF_DIR/pkgs.snapshot"
 THIRD_LIST="$CONF_DIR/thirdparty.list"
+REPOS_SNAPSHOT="$CONF_DIR/repos.snapshot"
 APK_CACHE="$CONF_DIR/apk-cache"
 SOURCES_FILE="$CONF_DIR/sources.list"
 OWUT_INIT="/etc/owut.d/asu-defaults.sh"
@@ -805,6 +806,30 @@ register_source() {
     printf '%s %s\n' "$repo" "$name" >> "$SOURCES_FILE"
 }
 
+# 记录第三方源行（官方源之外的全部），升级后原样加回——不依赖任何具体 feed 脚本
+snapshot_extra_repos() {
+    : > "$REPOS_SNAPSHOT" 2>/dev/null || return 1
+    for f in /etc/apk/repositories /etc/apk/repositories.d/*.list; do
+        [ -f "$f" ] || continue
+        grep -Ev '^[[:space:]]*(#|$)' "$f" 2>/dev/null \
+            | grep -Ev "$DISTRO_REPO_RE" >> "$REPOS_SNAPSHOT"
+    done
+    sort -u "$REPOS_SNAPSHOT" -o "$REPOS_SNAPSHOT" 2>/dev/null
+    [ -s "$REPOS_SNAPSHOT" ] || return 0
+    info "已记录 $(wc -l < "$REPOS_SNAPSHOT" | tr -d ' ') 个第三方源 -> $REPOS_SNAPSHOT"
+}
+
+# 把快照里的第三方源加回当前配置
+restore_extra_repos() {
+    [ -f "$REPOS_SNAPSHOT" ] || return 0
+    target=/etc/apk/repositories
+    while read -r u; do
+        [ -n "$u" ] || continue
+        grep -qsxF "$u" "$target" 2>/dev/null && continue
+        printf '%s\n' "$u" >> "$target" && info "已恢复第三方源: $u"
+    done < "$REPOS_SNAPSHOT"
+}
+
 # 升级前把第三方包本身的 apk 文件缓存下来（版本锁定、离线可还原）
 cache_thirdparty_apks() {
     [ -s "$THIRD_LIST" ] || return 0
@@ -856,6 +881,7 @@ step_snapshot() {
         warn "官方源索引不可用，无法识别第三方包；请先 sh $0 mirror 后重试"
         : > "$THIRD_LIST"
     fi
+    snapshot_extra_repos
 }
 
 # 按 sources.list 重装无法从 feed 取得的包（GitHub Release 等）
@@ -893,10 +919,9 @@ step_restore() {
         return 1
     fi
 
-    # 1) 第三方源先回来，缺失包才有得装
-    if ensure_nikki_feed; then
-        apk_update_force || warn "软件索引刷新失败，仍继续尝试恢复"
-    fi
+    # 1) 第三方源按升级前的快照加回（与具体 feed 无关），再刷新索引
+    restore_extra_repos
+    apk_update_force || warn "软件索引刷新失败，仍继续尝试恢复"
 
     # 2) 离线缓存优先（版本锁定）
     restore_offline_cache
