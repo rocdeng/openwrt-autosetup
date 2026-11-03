@@ -971,17 +971,29 @@ step_upgrade() {
 
     remove_list=""
     if [ -s "$THIRD_LIST" ]; then
-        while read -r p; do
-            [ -n "$p" ] || continue
-            remove_list="${remove_list:+$remove_list,}$p/if-installed"
-        done < "$THIRD_LIST"
+        # 清单来自已装数据库，这些包此刻确实都装着，直接传包名。
+        # 不用 /if-installed 后缀：旧版 owut 不识别，会报 "is not installed and cannot be removed"
+        remove_list=$(tr '\n' ' ' < "$THIRD_LIST" | sed 's/[[:space:]]*$//')
         log "从构建清单剔除 $(wc -l < "$THIRD_LIST" | tr -d ' ') 个第三方包（升级后自动装回）"
     fi
 
+    # 按当前 owut 实际支持的选项拼装，避免不同版本参数差异导致失败
+    owut_help=$(owut -h 2>&1)
+
     set -- upgrade
     [ -n "$remove_list" ] && set -- "$@" -r "$remove_list"
-    [ -f "$OWUT_INIT" ] && set -- "$@" -I "$OWUT_INIT"
-    [ -f "$OWUT_PRE" ] && set -- "$@" -p "$OWUT_PRE"
+    if [ -f "$OWUT_INIT" ]; then
+        case "$owut_help" in
+            *--init-script*)  set -- "$@" -I "$OWUT_INIT" ;;
+            *) warn "当前 owut 不支持 --init-script，首启还原标记不会随镜像下发" ;;
+        esac
+    fi
+    if [ -f "$OWUT_PRE" ]; then
+        case "$owut_help" in
+            *--pre-install*)  set -- "$@" -p "$OWUT_PRE" ;;
+            *) warn "当前 owut 不支持 --pre-install，刷机前不会自动快照" ;;
+        esac
+    fi
 
     log "执行: owut $*"
     owut "$@" || { err "owut 升级失败"; record_fail "upgrade"; return 1; }
