@@ -18,7 +18,6 @@ REPOS_SNAPSHOT="$CONF_DIR/repos.snapshot"
 APK_CACHE="$CONF_DIR/apk-cache"
 SOURCES_FILE="$CONF_DIR/sources.list"
 OWUT_INIT="/etc/owut.d/asu-defaults.sh"
-OWUT_PRE="$CONF_DIR/pre-install.sh"
 PKG_DB="/lib/apk/db/installed"
 
 NIKKI_FEED="https://github.com/nikkinikki-org/OpenWrt-nikki/raw/refs/heads/main/feed.sh"
@@ -71,7 +70,7 @@ usage() {
   nikki       添加 Nikki 源并安装
   argon       下载并安装 Argon 主题及配置工具 apk
   cert        安装 acme 和 luci-app-ddns
-  snapshot    记录当前已装软件清单（升级前由 owut pre-install 钩子调用）
+  snapshot    记录当前已装软件清单（upgrade 步骤开头会自动调用）
   restore     恢复升级前的软件与网络（首启由 autosetup 服务调用）
   upgrade     值守式升级：快照并备份第三方包 → owut 升级（升级后自动装回）
 
@@ -988,12 +987,9 @@ step_upgrade() {
             *) warn "当前 owut 不支持 --init-script，首启还原标记不会随镜像下发" ;;
         esac
     fi
-    if [ -f "$OWUT_PRE" ]; then
-        case "$owut_help" in
-            *--pre-install*)  set -- "$@" -p "$OWUT_PRE" ;;
-            *) warn "当前 owut 不支持 --pre-install，刷机前不会自动快照" ;;
-        esac
-    fi
+    # 不使用 owut 的 --pre-install：它经 ubus call file exec 执行且有超时，
+    # 我们的快照要跑 apk list/fetch，必然超时（实测 Request timed out）。
+    # 快照已在本步骤开头完成，这里无需再挂钩子。
     # 默认 0 = 下载镜像时完全不输出，看起来像卡死；显示进度便于判断是在下载还是真的挂了
     case "$owut_help" in
         *--progress-size*) set -- "$@" --progress-size "${OWUT_PROGRESS_SIZE:-1000}" ;;

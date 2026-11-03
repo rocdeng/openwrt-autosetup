@@ -68,15 +68,7 @@ for p in luci-app-openclash luci-theme-argon luci-app-argon-config; do
     esac
 done
 
-# ---- 3. 升级前钩子：写快照 ----
-cat > "$CONF/pre-install.sh" <<'PRE'
-#!/bin/sh
-# 由 owut --pre-install 调用：镜像校验通过、刷机前执行
-exec /bin/sh /etc/autosetup/setup.sh snapshot
-PRE
-chmod 755 "$CONF/pre-install.sh"
-
-# ---- 4. 首启还原脚本：等网络通再干活 ----
+# ---- 3. 首启还原脚本：等网络通再干活 ----
 cat > "$CONF/restore-boot.sh" <<'BOOT'
 #!/bin/sh
 # 开机后执行一次：等外网可达（最长 10 分钟）再恢复，失败保留标记下次开机重试
@@ -107,7 +99,7 @@ exit 0
 BOOT
 chmod 755 "$CONF/restore-boot.sh"
 
-# ---- 5. procd 服务：有标记才跑 ----
+# ---- 4. procd 服务：有标记才跑 ----
 cat > /etc/init.d/autosetup <<'INITD'
 #!/bin/sh /etc/rc.common
 # 升级后有 restore.flag 时执行一次还原；无标记则什么都不做
@@ -131,7 +123,7 @@ INITD
 chmod 755 /etc/init.d/autosetup
 /etc/init.d/autosetup enable
 
-# ---- 6. 随镜像下发的 uci-defaults：只负责置标记 ----
+# ---- 5. 随镜像下发的 uci-defaults：只负责置标记 ----
 cat > "$OWUT_D/asu-defaults.sh" <<'DEFAULTS'
 #!/bin/sh
 # 由 owut --init-script 带入镜像，首启时执行；不要在此放置任何凭据
@@ -144,15 +136,17 @@ exit 0
 DEFAULTS
 chmod 755 "$OWUT_D/asu-defaults.sh"
 
-# ---- 7. 配置 owut：只挂两个钩子（剔除名单由 setup.sh 每次升级前自动生成）----
+# ---- 6. 配置 owut：只挂两个钩子（剔除名单由 setup.sh 每次升级前自动生成）----
 uci -q get attendedsysupgrade.owut >/dev/null 2>&1 || uci set attendedsysupgrade.owut=owut
 uci set attendedsysupgrade.owut.init_script="$OWUT_D/asu-defaults.sh"
-uci set attendedsysupgrade.owut.pre_install="$CONF/pre-install.sh"
+# 不用 pre_install：owut 经 ubus file exec 调用且有超时，快照由 upgrade 步骤自己完成
+uci -q delete attendedsysupgrade.owut.pre_install
+rm -f "$CONF/pre-install.sh"
 uci -q delete attendedsysupgrade.owut.remove
 uci commit attendedsysupgrade
-info "已配置 owut：init_script / pre_install"
+info "已配置 owut：init_script（不使用 pre_install 钩子）"
 
-# ---- 8. 立刻快照一次，保证第一次升级就有清单与备份 ----
+# ---- 7. 立刻快照一次，保证第一次升级就有清单与备份 ----
 /bin/sh "$CONF/setup.sh" snapshot
 
 info "安装完成。之后的升级命令: sh /etc/autosetup/setup.sh upgrade"
