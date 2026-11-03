@@ -10,6 +10,16 @@ FORCE="${FORCE:-0}"
 GATEWAY="${GATEWAY:-192.168.1.1}"
 DNS_SERVERS="${DNS:-}"
 
+# 值守式升级的还原层：快照在升级前写入，随 /etc 备份跨固件保留
+CONF_DIR="/etc/autosetup"
+PKG_SNAPSHOT="$CONF_DIR/pkgs.snapshot"
+THIRD_LIST="$CONF_DIR/thirdparty.list"
+APK_CACHE="$CONF_DIR/apk-cache"
+SOURCES_FILE="$CONF_DIR/sources.list"
+OWUT_INIT="/etc/owut.d/asu-defaults.sh"
+OWUT_PRE="$CONF_DIR/pre-install.sh"
+PKG_DB="/lib/apk/db/installed"
+
 NIKKI_FEED="https://github.com/nikkinikki-org/OpenWrt-nikki/raw/refs/heads/main/feed.sh"
 
 DO_NETCHECK=0
@@ -18,6 +28,9 @@ DO_OPENCLASH=0
 DO_NIKKI=0
 DO_ARGON=0
 DO_CERT=0
+DO_SNAPSHOT=0
+DO_RESTORE=0
+DO_UPGRADE=0
 FAILED_STEPS=""
 
 mkdir -p "$TMP_DIR"
@@ -57,6 +70,9 @@ usage() {
   nikki       添加 Nikki 源并安装
   argon       下载并安装 Argon 主题及配置工具 apk
   cert        安装 acme 和 luci-app-ddns
+  snapshot    记录当前已装软件清单（升级前由 owut pre-install 钩子调用）
+  restore     恢复升级前的软件与网络（首启由 autosetup 服务调用）
+  upgrade     值守式升级：快照并备份第三方包 → owut 升级（升级后自动装回）
 
 选项:
   -p, --proxy <URL>   指定单个 GitHub 加速前缀（默认已自动使用内置镜像）
@@ -98,12 +114,15 @@ while [ $# -gt 0 ]; do
         nikki)     DO_NIKKI=1; shift ;;
         argon)     DO_ARGON=1; shift ;;
         cert)      DO_CERT=1; shift ;;
+        snapshot)  DO_SNAPSHOT=1; shift ;;
+        restore)   DO_RESTORE=1; shift ;;
+        upgrade)   DO_UPGRADE=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) warn "忽略未知参数: $1"; shift ;;
     esac
 done
 
-if [ "$DO_NETCHECK$DO_MIRROR$DO_OPENCLASH$DO_NIKKI$DO_ARGON$DO_CERT" = "000000" ]; then
+if [ "$DO_NETCHECK$DO_MIRROR$DO_OPENCLASH$DO_NIKKI$DO_ARGON$DO_CERT$DO_SNAPSHOT$DO_RESTORE$DO_UPGRADE" = "000000000" ]; then
     DO_NETCHECK=1; DO_MIRROR=1; DO_OPENCLASH=1; DO_NIKKI=1; DO_ARGON=1; DO_CERT=1
 fi
 
@@ -296,7 +315,9 @@ github_install() {
     assets=$(get_assets "$repo") || { err "无法获取 $repo 的发布信息（可尝试 -p  指定镜像）"; return 1; }
     url=$(pick_apk "$assets" "$name")
     [ -n "$url" ] || { err "$repo 未找到 $name 的 apk 包"; return 1; }
-    install_apk_url "$url" "$name"
+    install_apk_url "$url" "$name" || return 1
+    # 登记来源：这类包不在任何 feed 里，升级后只能按此记录重装
+    register_source "$repo" "$name"
 }
 
 if [ "$FLAVOR" = "immortal" ]; then
@@ -734,6 +755,213 @@ step_cert() {
     info "acme / DDNS 安装完成"
 }
 
+# ---- 值守式升级还原层 ----
+# 第三方包 = 已安装、但不在发行版官方软件源里的包（第三方 feed 或从 GitHub 安装）。
+# 全程不写死包名：识别、备份、剔除、还原都按实际清单计算。
+DISTRO_REPO_RE="${DISTRO_REPO_RE:-downloads\.openwrt\.org|downloads\.immortalwrt\.org|mirrors\.tuna\.tsinghua\.edu\.cn|mirrors\.immortalwrt\.org}"
+
+# 已装包名：优先读 apk 数据库（不受输出格式变化影响），回退 apk info
+list_installed() {
+    if [ -r "$PKG_DB" ]; then
+        sed -n 's/^P:\(.*\)$/\1/p' "$PKG_DB"
+        return 0
+    fi
+    apk info 2>/dev/null
+}
+
+# 只保留发行版官方源，生成临时 repositories 文件（第三方 feed 被排除）
+official_repo_file() {
+    out="$1"
+    : > "$out"
+    for f in /etc/apk/repositories /etc/apk/repositories.d/*.list; do
+        [ -f "$f" ] || continue
+        grep -Ev '^[[:space:]]*(#|$)' "$f" 2>/dev/null \
+            | grep -E "$DISTRO_REPO_RE" >> "$out"
+    done
+    [ -s "$out" ]
+}
+
+# 输出第三方包名：已装包减去「官方源里存在的包」
+thirdparty_packages() {
+    official_repo_file "$TMP_DIR/official.repos" || return 1
+    apk --repositories-file "$TMP_DIR/official.repos" list -a > "$TMP_DIR/official.pkgs" 2>/dev/null || return 1
+    [ -s "$TMP_DIR/official.pkgs" ] || return 1
+    list_installed | sort -u > "$TMP_DIR/installed.txt"
+    awk '
+        NR == FNR { want[$0] = 1; next }
+        {
+            for (n in want)
+                if (index($0, n "-") == 1 || $0 == n) found[n] = 1
+        }
+        END { for (n in want) if (!(n in found)) print n }
+    ' "$TMP_DIR/installed.txt" "$TMP_DIR/official.pkgs" | sort
+}
+
+# 记录包的来源（仅用于无法从任何 feed 取回的包）
+register_source() {
+    repo="$1"; name="$2"
+    mkdir -p "$CONF_DIR" 2>/dev/null
+    grep -qs "^$repo $name\$" "$SOURCES_FILE" && return 0
+    printf '%s %s\n' "$repo" "$name" >> "$SOURCES_FILE"
+}
+
+# 升级前把第三方包本身的 apk 文件缓存下来（版本锁定、离线可还原）
+cache_thirdparty_apks() {
+    [ -s "$THIRD_LIST" ] || return 0
+    mkdir -p "$APK_CACHE" || return 1
+    rm -f "$APK_CACHE"/*.apk 2>/dev/null
+    apk fetch -o "$APK_CACHE" $(cat "$THIRD_LIST") >/dev/null 2>&1
+    got=$(ls "$APK_CACHE"/*.apk 2>/dev/null | wc -l | tr -d ' ')
+    info "已离线备份 $got 个第三方包 -> $APK_CACHE"
+
+    # 既下载不到、也没登记来源的包，升级后无法自动装回：如实列出
+    unknown=""
+    for p in $(cat "$THIRD_LIST"); do
+        ls "$APK_CACHE/$p"-*.apk >/dev/null 2>&1 && continue
+        grep -qs " $p\$" "$SOURCES_FILE" && continue
+        unknown="$unknown $p"
+    done
+    if [ -n "$unknown" ]; then
+        warn "以下第三方包来源未知，升级后无法自动装回:$unknown"
+        info "登记方式（一次即可）: echo 'owner/repo 包名' >> $SOURCES_FILE"
+    fi
+}
+
+step_snapshot() {
+    section "记录软件清单与第三方包"
+    names=$(list_installed | sort -u)
+    if [ -z "$names" ]; then
+        err "无法获取已装软件列表（$PKG_DB 不可读且 apk info 无输出）"
+        record_fail "snapshot"
+        return 1
+    fi
+    mkdir -p "$CONF_DIR" || { err "无法创建 $CONF_DIR"; record_fail "snapshot"; return 1; }
+    if ! printf '%s\n' "$names" > "$PKG_SNAPSHOT"; then
+        err "写入清单失败: $PKG_SNAPSHOT"
+        record_fail "snapshot"
+        return 1
+    fi
+    info "已记录 $(wc -l < "$PKG_SNAPSHOT" | tr -d ' ') 个已装包 -> $PKG_SNAPSHOT"
+
+    if third=$(thirdparty_packages); then
+        if [ -n "$third" ]; then
+            printf '%s\n' "$third" > "$THIRD_LIST"
+            info "识别出 $(wc -l < "$THIRD_LIST" | tr -d ' ') 个第三方包 -> $THIRD_LIST"
+        else
+            : > "$THIRD_LIST"
+            info "未发现第三方包"
+        fi
+        cache_thirdparty_apks
+    else
+        warn "官方源索引不可用，无法识别第三方包；请先 sh $0 mirror 后重试"
+        : > "$THIRD_LIST"
+    fi
+}
+
+# 按 sources.list 重装无法从 feed 取得的包（GitHub Release 等）
+restore_sources() {
+    [ -f "$SOURCES_FILE" ] || return 0
+    rc=0
+    while read -r repo name rest; do
+        case "$repo" in ''|'#'*) continue ;; esac
+        [ -n "$name" ] || continue
+        is_installed "$name" && [ "$FORCE" != "1" ] && continue
+        github_install "$repo" "$name" || rc=1
+    done < "$SOURCES_FILE"
+    return $rc
+}
+
+# 优先用升级前的 apk 缓存离线还原（版本与升级前一致）
+restore_offline_cache() {
+    set -- "$APK_CACHE"/*.apk
+    [ -f "$1" ] || return 0
+    log "从离线缓存安装 $# 个 apk（版本与升级前一致）"
+    if apk add --allow-untrusted "$@" >/dev/null 2>&1; then
+        return 0
+    fi
+    for f in "$@"; do
+        apk add --allow-untrusted "$f" >/dev/null 2>&1 || warn "离线安装失败: ${f##*/}"
+    done
+    return 0
+}
+
+step_restore() {
+    section "恢复升级前的软件与网络"
+    if ! ensure_network; then
+        err "网络未就绪，无法恢复；恢复网络后重跑: sh $0 restore"
+        record_fail "restore"
+        return 1
+    fi
+
+    # 1) 第三方源先回来，缺失包才有得装
+    if ensure_nikki_feed; then
+        apk_update_force || warn "软件索引刷新失败，仍继续尝试恢复"
+    fi
+
+    # 2) 离线缓存优先（版本锁定）
+    restore_offline_cache
+
+    # 3) 与升级前清单比对，补齐其余缺失（来自 feed 的包）
+    restored=0
+    bad_pkgs=""
+    if [ -f "$PKG_SNAPSHOT" ]; then
+        list_installed | sort -u > "$TMP_DIR/cur.txt"
+        missing=$(grep -vxF -f "$TMP_DIR/cur.txt" "$PKG_SNAPSHOT" 2>/dev/null)
+        if [ -n "$missing" ]; then
+            log "仍有 $(printf '%s\n' "$missing" | wc -l | tr -d ' ') 个包缺失，在线补齐"
+            if apk add $missing >/dev/null 2>&1; then
+                restored=$(printf '%s\n' "$missing" | wc -l | tr -d ' ')
+            else
+                for p in $missing; do
+                    if apk add "$p" >/dev/null 2>&1; then
+                        restored=$((restored + 1))
+                    else
+                        bad_pkgs="$bad_pkgs $p"
+                    fi
+                done
+            fi
+        fi
+    else
+        warn "未找到升级前清单 $PKG_SNAPSHOT，跳过包恢复"
+    fi
+
+    # 4) 无法从 feed 取得的包，按登记的来源重装
+    restore_sources || bad_pkgs="$bad_pkgs <sources.list 中的包>"
+
+    if [ -n "$bad_pkgs" ]; then
+        warn "以下软件未能恢复，可能源里已不存在:$bad_pkgs"
+        record_fail "restore"
+        return 1
+    fi
+    info "恢复完成：在线补装 $restored 个包"
+}
+
+step_upgrade() {
+    section "值守式升级（自动剔除并备份第三方包）"
+    command -v owut >/dev/null 2>&1 \
+        || { err "未找到 owut（OpenWrt 25.12 起预装，旧版执行: apk add owut）"; record_fail "upgrade"; return 1; }
+    ensure_network || { err "网络未就绪，终止升级"; record_fail "upgrade"; return 1; }
+
+    step_snapshot || { err "快照失败，已中止升级"; record_fail "upgrade"; return 1; }
+
+    remove_list=""
+    if [ -s "$THIRD_LIST" ]; then
+        while read -r p; do
+            [ -n "$p" ] || continue
+            remove_list="${remove_list:+$remove_list,}$p/if-installed"
+        done < "$THIRD_LIST"
+        log "从构建清单剔除 $(wc -l < "$THIRD_LIST" | tr -d ' ') 个第三方包（升级后自动装回）"
+    fi
+
+    set -- upgrade
+    [ -n "$remove_list" ] && set -- "$@" -r "$remove_list"
+    [ -f "$OWUT_INIT" ] && set -- "$@" -I "$OWUT_INIT"
+    [ -f "$OWUT_PRE" ] && set -- "$@" -p "$OWUT_PRE"
+
+    log "执行: owut $*"
+    owut "$@" || { err "owut 升级失败"; record_fail "upgrade"; return 1; }
+}
+
 if [ -n "$GITHUB_PROXY" ]; then
     GH_MODE="$GITHUB_PROXY"
 elif [ "$DIRECT" = 1 ]; then
@@ -761,6 +989,9 @@ printf '%s' "$C_RESET"
 [ "$DO_NIKKI" -eq 1 ]     && step_nikki
 [ "$DO_ARGON" -eq 1 ]     && step_argon
 [ "$DO_CERT" -eq 1 ]      && step_cert
+[ "$DO_SNAPSHOT" -eq 1 ]  && step_snapshot
+[ "$DO_RESTORE" -eq 1 ]   && step_restore
+[ "$DO_UPGRADE" -eq 1 ]   && step_upgrade
 
 section "执行结果汇总"
 if [ -z "$FAILED_STEPS" ]; then

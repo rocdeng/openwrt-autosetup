@@ -106,6 +106,32 @@ DNS 失败时 `configure_dns` 将 DNS 列表（默认网关 + 223.5.5.5、119.29
 - acme：`acme luci-app-acme luci-i18n-acme-zh-cn`
 - DDNS：`ddns-scripts luci-app-ddns luci-i18n-ddns-zh-cn`
 
+### 6. 值守式升级还原层（step_snapshot / step_restore / step_upgrade）
+
+**要解决的问题**：Attended Sysupgrade（`owut` / LuCI ASU）把设备已装包清单发给构建服务器，服务器只用**官方 feed** 解析（已核实 `sysupgrade.openwrt.org` 的 `overview.json` 中 `repository_allow_list` 为空）。因此第三方 feed 的包（Nikki）和 GitHub Release 安装的包（OpenClash/Argon）无法烘焙进镜像，升级后必然丢失。
+
+**做法**：不写死任何包名，全部按实际清单计算。
+
+1. **识别第三方包** `thirdparty_packages`：
+   - 从 `/etc/apk/repositories`(+`repositories.d/*.list`) 中筛出官方源行（白名单正则 `DISTRO_REPO_RE`，默认匹配 `downloads.openwrt.org` / `mirrors.tuna.tsinghua.edu.cn` 等；第三方 feed 行被排除）；
+   - 以该文件作为 `apk --repositories-file` 覆盖，取官方可用包索引 `apk list -a`；
+   - 用一次 `awk` 比对已装清单（`/lib/apk/db/installed` 的 `P:` 行）与官方索引，差集即第三方包，写入 `/etc/autosetup/thirdparty.list`。
+2. **备份** `cache_thirdparty_apks`：对第三方包执行 `apk fetch -o /etc/autosetup/apk-cache`，把 **apk 文件本身**存下来（版本锁定、离线可还原）。下载不到且未登记来源的包会明确告警。
+3. **来源登记** `/etc/autosetup/sources.list`（`owner/repo 包名`）：只用于 GitHub 这类任何 feed 都没有的包；`github_install` 安装成功后自动登记，因此以后新装的包无需人工维护。
+4. **升级编排** `step_upgrade`：先快照/备份，再由 `thirdparty.list` 动态生成 `owut upgrade -r <pkg>/if-installed,...`（`/if-installed` 后缀保证包不存在时不报错），并挂上 `-I`（随镜像下发的 uci-defaults）与 `-p`（刷机前快照）。
+5. **首启还原** `step_restore`，由 procd 服务在开机后触发：
+   - 先恢复第三方源（Nikki feed）并刷新索引；
+   - 优先用 `apk add --allow-untrusted /etc/autosetup/apk-cache/*.apk` 离线装回（版本与升级前一致）；
+   - 再用快照差集在线补齐其余缺失；
+   - 最后按 `sources.list` 重装 GitHub 类包。
+
+**钩子说明**：`--init-script` 的脚本会被放进镜像 `/etc/uci-defaults/99-asu-defaults`，内容会上传构建服务器且可从构建哈希公开下载，因此里面**不能有凭据**；它只负责置一个标记。真正的重活由 `/etc/init.d/autosetup` 在开机后等外网可达时执行，失败保留标记、下次开机重试。
+
+**已知边界**：
+- 跨大版本若触发 `sysupgrade -n`（配置不兼容），静态 IP 会丢，还原层无法联网 → 需先手工恢复网络；
+- 离线缓存只能在源里仍存在该版本时被 `apk fetch` 取到；取不到且未登记来源的包无法自动还原；
+- 无法凭空推断历史 GitHub 包的仓库地址，需一次性登记。
+
 ## 六、通用机制（关键函数）
 
 - **下载 `dl`**：优先 `curl`，否则 `wget`。启动时一次性探测 `HAVE_CURL`/`HAVE_WGET`；
@@ -144,6 +170,11 @@ sh setup.sh -p https://ghproxy.net/   # GitHub 受限时配置加速前缀
 
 FORCE=1 sh setup.sh argon         # 已安装也强制重装
 sh setup.sh -h                    # 查看帮助
+
+# 值守式升级（先装一次还原层，之后用这条命令升级）
+wget -O restore-install.sh https://raw.githubusercontent.com/rocdeng/openwrt-autosetup/main/restore/install.sh
+sh restore-install.sh             # 安装还原层（一次性）
+sh /etc/autosetup/setup.sh upgrade   # 快照 → 备份第三方包 → owut 升级 → 首启自动装回
 ```
 
 ## 八、验证情况
@@ -166,6 +197,22 @@ sh setup.sh -h                    # 查看帮助
 
 ```
 openwrt-after-upgrade/
-├── setup.sh   # 唯一的自包含自动化脚本
-└── plan.md    # 本说明文档
+├── setup.sh            # 唯一的自包含自动化脚本（含 snapshot/restore/upgrade 子命令）
+├── restore/
+│   └── install.sh      # 值守式升级还原层安装器（自包含，含各钩子脚本）
+└── plan.md             # 本说明文档
+```
+
+设备上安装还原层后的落点（均在 `/etc`，随 sysupgrade 备份跨固件保留）：
+
+```
+/etc/autosetup/setup.sh           # 脚本副本（开机服务调用它执行 restore）
+/etc/autosetup/pre-install.sh     # owut --pre-install 钩子：刷机前快照
+/etc/autosetup/restore-boot.sh    # 首启还原包装（等外网可达）
+/etc/autosetup/pkgs.snapshot      # 升级前已装包清单
+/etc/autosetup/thirdparty.list    # 自动识别出的第三方包
+/etc/autosetup/apk-cache/         # 第三方包的 apk 离线备份
+/etc/autosetup/sources.list       # 只能从 GitHub 获取的包的来源登记
+/etc/init.d/autosetup             # procd 服务：有 restore.flag 才执行一次还原
+/etc/owut.d/asu-defaults.sh       # 随镜像下发的 uci-defaults（只置标记，无凭据）
 ```
