@@ -994,6 +994,10 @@ step_upgrade() {
             *) warn "当前 owut 不支持 --pre-install，刷机前不会自动快照" ;;
         esac
     fi
+    # 默认 0 = 下载镜像时完全不输出，看起来像卡死；显示进度便于判断是在下载还是真的挂了
+    case "$owut_help" in
+        *--progress-size*) set -- "$@" --progress-size "${OWUT_PROGRESS_SIZE:-1000}" ;;
+    esac
 
     log "执行: owut $*"
     owut "$@" || { err "owut 升级失败"; record_fail "upgrade"; return 1; }
