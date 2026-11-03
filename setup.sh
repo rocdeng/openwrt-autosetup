@@ -783,9 +783,18 @@ official_repo_file() {
 
 # 输出第三方包名：已装包减去「官方源里存在的包」
 thirdparty_packages() {
-    official_repo_file "$TMP_DIR/official.repos" || return 1
-    apk --repositories-file "$TMP_DIR/official.repos" list -a > "$TMP_DIR/official.pkgs" 2>/dev/null || return 1
-    [ -s "$TMP_DIR/official.pkgs" ] || return 1
+    official_repo_file "$TMP_DIR/official.repos" || {
+        printf '未找到任何官方源行（检查 /etc/apk/repositories）\n' > "$TMP_DIR/official.err"
+        return 1
+    }
+    if ! apk --repositories-file "$TMP_DIR/official.repos" list -a \
+            > "$TMP_DIR/official.pkgs" 2> "$TMP_DIR/official.err"; then
+        return 1
+    fi
+    [ -s "$TMP_DIR/official.pkgs" ] || {
+        printf '官方源索引为空（索引未下载，可先执行 apk update）\n' > "$TMP_DIR/official.err"
+        return 1
+    }
     list_installed | sort -u > "$TMP_DIR/installed.txt"
     awk '
         NR == FNR { want[$0] = 1; next }
@@ -877,8 +886,18 @@ step_snapshot() {
         fi
         cache_thirdparty_apks
     else
-        warn "官方源索引不可用，无法识别第三方包；请先 sh $0 mirror 后重试"
-        : > "$THIRD_LIST"
+        why=$(head -n 2 "$TMP_DIR/official.err" 2>/dev/null | tr '\n' ' ')
+        if [ -s "$THIRD_LIST" ]; then
+            # 已有上次的成功结果，绝不能清空——否则 owut 会因第三方包缺货而拒绝升级
+            warn "官方源索引不可用（${why:-未知原因}），沿用上次识别的 $(wc -l < "$THIRD_LIST" | tr -d ' ') 个第三方包"
+            cache_thirdparty_apks
+        else
+            err "官方源索引不可用（${why:-未知原因}），且没有历史清单，无法判断哪些包需要剔除"
+            info "先执行 sh $0 mirror 刷新索引，或检查网络后重试"
+            record_fail "snapshot"
+            snapshot_extra_repos
+            return 1
+        fi
     fi
     snapshot_extra_repos
 }
