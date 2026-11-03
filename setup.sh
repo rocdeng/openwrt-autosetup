@@ -920,11 +920,12 @@ restore_offline_cache() {
     set -- "$APK_CACHE"/*.apk
     [ -f "$1" ] || return 0
     log "从离线缓存安装 $# 个 apk（版本与升级前一致）"
-    if apk add --allow-untrusted "$@" >/dev/null 2>&1; then
+    if apk add --allow-untrusted "$@" >/dev/null 2>"$TMP_DIR/apk.err"; then
         return 0
     fi
     for f in "$@"; do
-        apk add --allow-untrusted "$f" >/dev/null 2>&1 || warn "离线安装失败: ${f##*/}"
+        apk add --allow-untrusted "$f" >/dev/null 2>"$TMP_DIR/apk.err" \
+            || warn "离线安装失败 ${f##*/}: $(head -n 2 "$TMP_DIR/apk.err" 2>/dev/null | tr '\n' ' ')"
     done
     return 0
 }
@@ -952,14 +953,15 @@ step_restore() {
         missing=$(grep -vxF -f "$TMP_DIR/cur.txt" "$PKG_SNAPSHOT" 2>/dev/null)
         if [ -n "$missing" ]; then
             log "仍有 $(printf '%s\n' "$missing" | wc -l | tr -d ' ') 个包缺失，在线补齐"
-            if apk add $missing >/dev/null 2>&1; then
+            if apk add $missing >/dev/null 2>"$TMP_DIR/apk.err"; then
                 restored=$(printf '%s\n' "$missing" | wc -l | tr -d ' ')
             else
                 for p in $missing; do
-                    if apk add "$p" >/dev/null 2>&1; then
+                    if apk add "$p" >/dev/null 2>"$TMP_DIR/apk.err"; then
                         restored=$((restored + 1))
                     else
                         bad_pkgs="$bad_pkgs $p"
+                        warn "安装失败 $p: $(head -n 2 "$TMP_DIR/apk.err" 2>/dev/null | tr '\n' ' ')"
                     fi
                 done
             fi
