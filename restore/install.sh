@@ -88,7 +88,14 @@ if [ "$i" -ge 120 ]; then
     exit 0
 fi
 
-if /bin/sh /etc/autosetup/setup.sh restore; then
+# 输出同时落盘：syslog 会滚动，事后排查需要完整记录
+LOG=/etc/autosetup/restore.log
+printf '\n===== %s 开机恢复 =====\n' "$(date '+%F %T')" >> "$LOG"
+/bin/sh /etc/autosetup/setup.sh restore >> "$LOG" 2>&1
+rc=$?
+logger -t autosetup "restore 退出码 $rc，详见 $LOG"
+
+if [ "$rc" -eq 0 ]; then
     rm -f "$FLAG"
     logger -t autosetup "升级后软件恢复完成"
     exit 0
