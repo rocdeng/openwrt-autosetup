@@ -186,8 +186,10 @@ echo '0 4 * * 6 /usr/bin/autosetup upgrade >> /etc/autosetup/cron.log 2>&1' >> /
 | `/etc/autosetup/apk-cache/` | 第三方包 apk 离线备份（版本锁定） |
 | `/etc/autosetup/sources.list` | 只能从 GitHub 获取的包的来源登记 |
 | `/etc/autosetup/restore.log` | 每次开机还原的完整日志 |
+| `/etc/autosetup/cron.log` | 启用定时升级时的输出 |
 | `/etc/init.d/autosetup` | procd 服务，有 `restore.flag` 才执行一次 |
-| `/etc/owut.d/asu-defaults.sh` | 随镜像下发的 uci-defaults，仅置标记 |
+| `/etc/autosetup/asu-defaults.sh` | 随镜像下发的 uci-defaults，仅置标记（放在保留目录内） |
+| `/etc/autosetup/init.d-autosetup` | procd 服务文件副本，升级后据此重建 `/etc/init.d/autosetup` |
 
 ## 10. 手动操作速查
 

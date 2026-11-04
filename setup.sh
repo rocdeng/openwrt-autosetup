@@ -18,7 +18,9 @@ REPOS_SNAPSHOT="$CONF_DIR/repos.snapshot"
 APK_CACHE="$CONF_DIR/apk-cache"
 KEYS_DIR="$CONF_DIR/keys"
 SOURCES_FILE="$CONF_DIR/sources.list"
-OWUT_INIT="/etc/owut.d/asu-defaults.sh"
+# init-script 与服务工作副本都放在 /etc/autosetup 下：只有这个目录被登记进
+# /etc/sysupgrade.conf，升级后仍然存在
+OWUT_INIT="$CONF_DIR/asu-defaults.sh"
 PKG_DB="/lib/apk/db/installed"
 
 NIKKI_FEED="https://github.com/nikkinikki-org/OpenWrt-nikki/raw/refs/heads/main/feed.sh"
@@ -1021,6 +1023,47 @@ step_restore() {
     info "恢复完成：在线补装 $restored 个包"
 }
 
+# 服务与 init-script 都不在 sysupgrade 白名单里，升级后会消失；
+# 每次升级前按需重建，避免“标记没生成 → 开机不还原”这种静默失效
+ensure_restore_files() {
+    mkdir -p "$CONF_DIR" 2>/dev/null
+
+    if [ ! -f "$OWUT_INIT" ]; then
+        cat > "$OWUT_INIT" <<'EOS'
+#!/bin/sh
+# 由 owut --init-script 带入镜像，首启执行；不要在此放置任何凭据
+# （内容会上传构建服务器，并可从构建哈希公开下载）
+mkdir -p /etc/autosetup
+touch /etc/autosetup/restore.flag
+# 服务文件本身不在 sysupgrade 白名单，从 /etc/autosetup 的副本重建
+if [ -f /etc/autosetup/init.d-autosetup ]; then
+    cp -f /etc/autosetup/init.d-autosetup /etc/init.d/autosetup
+    chmod 755 /etc/init.d/autosetup
+    /etc/init.d/autosetup enable 2>/dev/null
+fi
+ln -sf /etc/autosetup/setup.sh /usr/bin/autosetup 2>/dev/null
+exit 0
+EOS
+        chmod 755 "$OWUT_INIT"
+        info "已重建 $OWUT_INIT"
+    fi
+
+    if [ ! -f /etc/init.d/autosetup ]; then
+        if [ -f "$CONF_DIR/init.d-autosetup" ]; then
+            mkdir -p /etc/init.d 2>/dev/null
+            if cp -f "$CONF_DIR/init.d-autosetup" /etc/init.d/autosetup 2>/dev/null; then
+                chmod 755 /etc/init.d/autosetup
+                /etc/init.d/autosetup enable 2>/dev/null
+                info "已从副本重建 /etc/init.d/autosetup"
+            else
+                warn "重建 /etc/init.d/autosetup 失败"
+            fi
+        else
+            warn "缺少服务文件 /etc/init.d/autosetup，升级后无法自动还原"
+        fi
+    fi
+}
+
 step_upgrade() {
     section "值守式升级（自动剔除并备份第三方包）"
     command -v owut >/dev/null 2>&1 \
@@ -1028,6 +1071,7 @@ step_upgrade() {
     ensure_network || { err "网络未就绪，终止升级"; record_fail "upgrade"; return 1; }
 
     step_snapshot || { err "快照失败，已中止升级"; record_fail "upgrade"; return 1; }
+    ensure_restore_files
 
     remove_list=""
     if [ -s "$THIRD_LIST" ]; then

@@ -129,28 +129,37 @@ service_triggers() {
 INITD
 chmod 755 /etc/init.d/autosetup
 /etc/init.d/autosetup enable
+# /etc/init.d 不在 sysupgrade 白名单，副本放进保留目录，升级后据此重建
+cp -f /etc/init.d/autosetup "$CONF/init.d-autosetup"
+chmod 755 "$CONF/init.d-autosetup"
 
 # ---- 5. 随镜像下发的 uci-defaults：只负责置标记 ----
-cat > "$OWUT_D/asu-defaults.sh" <<'DEFAULTS'
+cat > "$CONF/asu-defaults.sh" <<'DEFAULTS'
 #!/bin/sh
 # 由 owut --init-script 带入镜像，首启时执行；不要在此放置任何凭据
 # （该文件内容会上传构建服务器，并可从构建哈希公开下载）
-[ -x /etc/init.d/autosetup ] || exit 0
 mkdir -p /etc/autosetup
 touch /etc/autosetup/restore.flag
-/etc/init.d/autosetup enable 2>/dev/null
-# 短命令别名放在 /usr（不在 sysupgrade 白名单），每次首启重建
+# 服务文件不在 sysupgrade 白名单，从保留目录的副本重建
+mkdir -p /etc/init.d
+if [ -f /etc/autosetup/init.d-autosetup ]; then
+    cp -f /etc/autosetup/init.d-autosetup /etc/init.d/autosetup
+    chmod 755 /etc/init.d/autosetup
+    /etc/init.d/autosetup enable 2>/dev/null
+fi
+# 短命令别名也在白名单外，每次首启重建
 ln -sf /etc/autosetup/setup.sh /usr/bin/autosetup 2>/dev/null
 exit 0
 DEFAULTS
-chmod 755 "$OWUT_D/asu-defaults.sh"
+chmod 755 "$CONF/asu-defaults.sh"
 
 # 立刻建立一次别名，安装后即可用 `autosetup upgrade`
 ln -sf "$CONF/setup.sh" /usr/bin/autosetup 2>/dev/null
 
 # ---- 6. 配置 owut：只挂两个钩子（剔除名单由 setup.sh 每次升级前自动生成）----
 uci -q get attendedsysupgrade.owut >/dev/null 2>&1 || uci set attendedsysupgrade.owut=owut
-uci set attendedsysupgrade.owut.init_script="$OWUT_D/asu-defaults.sh"
+uci set attendedsysupgrade.owut.init_script="$CONF/asu-defaults.sh"
+rm -f "$OWUT_D/asu-defaults.sh"   # 旧位置不在白名单，弃用
 # 不用 pre_install：owut 经 ubus file exec 调用且有超时，快照由 upgrade 步骤自己完成
 uci -q delete attendedsysupgrade.owut.pre_install
 rm -f "$CONF/pre-install.sh"
