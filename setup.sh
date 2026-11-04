@@ -195,7 +195,9 @@ apk_update_force() {
     if [ -n "$avail" ] && [ "$avail" -gt 0 ]; then
         APK_PARTIAL=1
         APK_UPDATED=1
-        bad=$(printf '%s\n' "$out" | sed -n 's/^WARNING: updating and opening \(.*\): [^:]*$/\1/p' | sort -u | tr '\n' ' ')
+        bad=$(printf '%s\n' "$out" | sed -n \
+            -e 's/^WARNING: updating and opening \(.*\): [^:]*$/\1/p' \
+            -e 's/^WARNING: updating \(.*\): [^:]*$/\1/p' | sort -u | tr '\n' ' ')
         warn "部分软件源不可用，其余源索引已更新，继续执行。不可用的源: ${bad:-见上方 WARNING}"
         return 0
     fi
