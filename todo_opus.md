@@ -160,3 +160,10 @@
 - [x] 原因：新版 owut 的 `--repositories-mode` 默认是 `append`，会把 `/etc/apk/repositories.d/` 下除 `distfeeds.list` 外所有文件里的源（这里是 `customfeeds.list` 中的 Nikki 源）连同 `/etc/apk/keys` 一起提交给 ASU。官方服务器不允许任何外部源。
 - [x] 修复：owut 支持该参数时，自动追加 `--repositories-mode disable`。第三方包本来就已经用 `-r` 剔除，升级后由还原层装回。
 - [ ] 待观察：同次输出里的 `404 ... releases/25.12.6/targets/x86/64/kmods/6.12.71-.../index.json` 是 owut 用旧内核的 kmods 路径去查新版本，看起来不影响构建（随后正常打印了版本对比），修复后再确认一次。
+
+## 十二、严重：升级后全部配置丢失（主机名变回 OpenWrt）
+
+- [x] 排除：owut 调用 `sysupgrade <镜像>` 时不带 `-n`，默认保留配置；本脚本也从不传 `-n`。
+- [x] 最可能的原因（待设备证据确认）：在 x86 上，sysupgrade 写完镜像后，`platform_copy_config` 会把配置备份 `cp` 到引导分区（默认只有 16MB，内核已经占去大半），而且**不检查 cp 的返回值**。备份放不下时，升级照常完成，首次启动找不到备份，全部配置被静默丢弃。`/etc/autosetup/apk-cache`（含 nikki/mihomo 二进制）、`github-cache` 以及 OpenClash 的大文件都会撑大备份。
+- [x] 修复：`upgrade` 在调用 owut 前先 `sysupgrade -b` 生成一次真实备份，和 `/boot` 的剩余空间比较（留 2MB 余量）。放不下时，先把离线缓存移出备份再检查；仍然放不下就中止升级，并列出备份中最大的文件。owut 失败时会把缓存移回原处。
+- [ ] 设备侧：确认引导分区大小与剩余空间、检查有没有残留的 `sysupgrade.tgz`，并恢复配置。

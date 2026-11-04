@@ -1404,6 +1404,81 @@ exit 0' > "$OWUT_INIT" 2>/dev/null; then
     ensure_keep_entry
 }
 
+# ---- 配置备份体积守卫 ----
+# x86 等平台：sysupgrade 刷完镜像后，由 platform_copy_config 把配置备份
+# cp 到引导分区（默认仅 16MB，内核已占去大半）。空间不够时 cp 失败，
+# 但脚本不检查返回值——升级照常完成，首启找不到备份，全部配置静默丢失。
+# 因此刷机前先生成一次真实备份，和引导分区剩余空间比较。
+MOVED_CACHE_DIR=""
+
+# 返回 0=放得下 1=放不下 2=无法判断；结果放入 BACKUP_KB / BOOT_AVAIL_KB
+check_backup_fits() {
+    BACKUP_KB=""; BOOT_AVAIL_KB=""
+    bk="$TMP_DIR/backup-test.tgz"
+    rm -f "$bk"
+    sysupgrade -b "$bk" >/dev/null 2>&1 || { rm -f "$bk"; return 2; }
+    BACKUP_KB=$(( ($(wc -c < "$bk") + 1023) / 1024 ))
+    # 体积最大的几个文件，便于定位
+    tar -tzvf "$bk" 2>/dev/null | awk '{ print $3, $NF }' | sort -rn | head -n 5 \
+        > "$TMP_DIR/backup-top.txt"
+    rm -f "$bk"
+    # 只有单独挂载引导分区的平台（x86 等）有此限制
+    grep -qs ' /boot ' /proc/mounts || return 0
+    BOOT_AVAIL_KB=$(df -k /boot 2>/dev/null | awk 'NR == 2 { print $4 }')
+    [ -n "$BOOT_AVAIL_KB" ] || return 2
+    # 留 2MB 余量：新内核可能比旧内核大
+    [ "$BACKUP_KB" -lt $((BOOT_AVAIL_KB - 2048)) ] && return 0
+    return 1
+}
+
+restore_moved_caches() {
+    [ -n "$MOVED_CACHE_DIR" ] && [ -d "$MOVED_CACHE_DIR" ] || return 0
+    for d in "$MOVED_CACHE_DIR"/*; do
+        [ -e "$d" ] && mv "$d" "$CONF_DIR/" 2>/dev/null
+    done
+    rm -rf "$MOVED_CACHE_DIR"
+    MOVED_CACHE_DIR=""
+}
+
+guard_backup_size() {
+    check_backup_fits
+    fit=$?
+    if [ "$fit" = 2 ]; then
+        if [ -z "$BACKUP_KB" ]; then
+            err "无法生成测试备份（sysupgrade -b 失败），为防止配置丢失已中止升级"
+            return 1
+        fi
+        warn "无法读取引导分区剩余空间，跳过体积检查（备份 ${BACKUP_KB}KB）"
+        return 0
+    fi
+    if [ "$fit" = 0 ]; then
+        info "配置备份 ${BACKUP_KB}KB${BOOT_AVAIL_KB:+，引导分区剩余 ${BOOT_AVAIL_KB}KB}，空间足够"
+        return 0
+    fi
+
+    warn "配置备份 ${BACKUP_KB}KB，引导分区仅剩 ${BOOT_AVAIL_KB}KB：直接升级会丢失全部配置"
+    # 先牺牲离线缓存：升级后改为在线还原，配置比版本锁定重要得多
+    if [ -d "$APK_CACHE" ] || [ -d "$GH_CACHE" ]; then
+        MOVED_CACHE_DIR="$TMP_DIR/moved-cache"
+        rm -rf "$MOVED_CACHE_DIR"; mkdir -p "$MOVED_CACHE_DIR"
+        [ -d "$APK_CACHE" ] && mv "$APK_CACHE" "$MOVED_CACHE_DIR/"
+        [ -d "$GH_CACHE" ] && mv "$GH_CACHE" "$MOVED_CACHE_DIR/"
+        warn "已将离线缓存移出备份（本次升级后改为在线还原），重新检查"
+        check_backup_fits
+        fit=$?
+        if [ "$fit" = 0 ]; then
+            info "移出离线缓存后备份 ${BACKUP_KB}KB，空间足够"
+            return 0
+        fi
+    fi
+    restore_moved_caches
+    err "配置备份 ${BACKUP_KB}KB 仍超过引导分区剩余空间 ${BOOT_AVAIL_KB}KB，已中止升级"
+    info "备份中最大的文件（KB 前为字节数）:"
+    cat "$TMP_DIR/backup-top.txt" 2>/dev/null | tee -a "$LOG_FILE"
+    info "请把大文件移出 /etc 或从 /etc/sysupgrade.conf 删除对应条目后重试"
+    return 1
+}
+
 step_upgrade() {
     section "值守式升级（自动剔除并备份第三方包）"
     command -v owut >/dev/null 2>&1 \
@@ -1425,6 +1500,9 @@ step_upgrade() {
         record_fail "upgrade"
         return 1
     fi
+
+    # 配置备份必须能放进目标位置，否则 sysupgrade 会静默丢弃全部配置（见 check_backup_fits）
+    guard_backup_size || { record_fail "upgrade"; return 1; }
 
     # 兜底：标记放在保留目录里，即使 owut 不支持 -I 也能在升级后触发还原
     # （服务文件与 rc.d 自启链接已登记进 sysupgrade.conf）。
@@ -1469,6 +1547,7 @@ step_upgrade() {
     log "执行: owut $*"
     owut "$@" || {
         rm -f "$RESTORE_FLAG"
+        restore_moved_caches
         err "owut 升级失败（未刷机，已撤销还原标记）"
         record_fail "upgrade"
         return 1
