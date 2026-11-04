@@ -119,3 +119,18 @@
 - [ ] 已经装好的 GitHub 包没有离线副本，要等下次通过脚本重装才会生成。
 - [ ] 设备上更新 `setup.sh` 后，要先执行一次 `autosetup snapshot` 再升级，否则旧快照缺少 world/release 信息。
 - [ ] 以上修复只做了语法检查和桩测试，仍需在真机上完整走一遍升级。
+
+## 六、第三轮：真机 snapshot 输出暴露的问题（已修复）
+
+真机环境：OpenWrt 25.12.0 / x86_64，识别出 10 个第三方包，离线备份 0 个，其中 7 个来源未知。
+
+- [x] **BusyBox `sort` 参数顺序**：`sort -u FILE -o FILE` 在 BusyBox 下会把 `-o` 当成文件名，结果是源行被打印到终端，而且没有去重。已改为 `sort -u -o FILE FILE`。
+- [x] **小版本升级时 kmods 源不改写**：daeuniverse 的 kmods 源路径里带完整版本号（`.../25.12/kmods/25.12.0/...`），25.12.0 升到 25.12.1 时也必须改写。现在只要完整版本号变化就替换版本号，分支号只在跨分支时替换。源文件如果随 sysupgrade 保留了下来，就在原文件里改写，避免新旧两行并存。
+- [x] **仓库标签 `@tag` 被去掉**：带标签源里的包只有按 `name@tag` 才能装上。上一轮把 world 里的 `@tag` 去掉是错的，现在保留标签，只按包名做比对。
+- [x] **来源未知的包不拦截升级**：之前只打印警告，升级照常继续，这些包会静默丢失。现在 `upgrade` 默认中止并列出包名，`ALLOW_LOSS=1` 才放行。
+- [x] **`apk fetch` 失败原因被丢弃**：现在写进 `run.log` 的 `[fetch 包名]` 行。
+
+## 七、设备侧待确认
+
+- [ ] `nikki`、`luci-app-nikki`、`luci-i18n-nikki-zh-cn` 已经装着，但当前源里没有 Nikki 源（`repos.snapshot` 只有 daeuniverse 两行），所以既拿不到离线副本，也没法在线装回。需要重新执行 `autosetup nikki` 补回 Nikki 源。
+- [ ] `chinadns-ng`、`dns2socks`、`shadowsocksr-libev-ssr-local`、`tcping` 的所属源不在当前配置里。要么补回对应的源，要么在不需要时卸载。

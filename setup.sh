@@ -42,6 +42,7 @@ DO_SNAPSHOT=0
 DO_RESTORE=0
 DO_UPGRADE=0
 FAILED_STEPS=""
+UNKNOWN_PKGS=""
 
 mkdir -p "$TMP_DIR"
 : > "$LOG_FILE"
@@ -93,6 +94,7 @@ usage() {
 
 环境变量:
   FORCE=1             已安装也重新安装
+  ALLOW_LOSS=1        upgrade 时即使有包升级后无法装回也继续（默认拦截）
   GITHUB_PROXY=<URL>  同 --proxy
   GATEWAY=<IP>        同 --gateway
   DNS="<IP> ..."      同 --dns，空格分隔多个
@@ -888,7 +890,9 @@ snapshot_extra_repos() {
         grep -Ev '^[[:space:]]*(#|$)' "$f" 2>/dev/null \
             | grep -Ev "$DISTRO_REPO_RE" >> "$REPOS_SNAPSHOT"
     done
-    sort -u "$REPOS_SNAPSHOT" -o "$REPOS_SNAPSHOT" 2>/dev/null
+    # 选项必须写在文件名之前：BusyBox sort 遇到第一个非选项参数就停止解析，
+    # 写成 `sort -u FILE -o FILE` 会把内容打印到终端且不去重
+    sort -u -o "$REPOS_SNAPSHOT" "$REPOS_SNAPSHOT" 2>/dev/null
     [ -s "$REPOS_SNAPSHOT" ] || return 0
     info "已记录 $(wc -l < "$REPOS_SNAPSHOT" | tr -d ' ') 个第三方源 -> $REPOS_SNAPSHOT"
 }
@@ -902,16 +906,20 @@ release_branch() {
     printf '%s' "${b:-$1}"
 }
 
-# 读取升级前的发行版信息，判断是否跨分支（小版本升级不算）
-# 结果写入全局变量 OLD_ID OLD_REL OLD_BRANCH NEW_BRANCH BRANCH_CHANGED
+# 读取升级前的发行版信息，判断版本/分支是否变化
+# 结果写入全局变量 OLD_ID OLD_REL OLD_BRANCH NEW_BRANCH REL_CHANGED BRANCH_CHANGED
+#   REL_CHANGED=1    完整版本号变了（含小版本，如 25.12.0 -> 25.12.1）
+#   BRANCH_CHANGED=1 分支变了（如 24.10 -> 25.12），离线缓存不再可靠
 detect_release_change() {
-    OLD_ID=""; OLD_REL=""; OLD_BRANCH=""; BRANCH_CHANGED=0
+    OLD_ID=""; OLD_REL=""; OLD_BRANCH=""; REL_CHANGED=0; BRANCH_CHANGED=0
     NEW_BRANCH=$(release_branch "${DISTRIB_RELEASE:-}")
     [ -f "$RELEASE_MARK" ] || return 0
     read -r OLD_ID OLD_REL < "$RELEASE_MARK" 2>/dev/null
     OLD_BRANCH=$(release_branch "$OLD_REL")
+    [ "$OLD_REL" != "$DISTRIB_RELEASE" ] && REL_CHANGED=1
     if [ "$OLD_ID" != "$DISTRIB_ID" ] || [ "$OLD_BRANCH" != "$NEW_BRANCH" ]; then
         BRANCH_CHANGED=1
+        REL_CHANGED=1
     fi
 }
 
@@ -920,7 +928,29 @@ sed_escape() {
     printf '%s' "$1" | sed 's/[.[\*^$#]/\\&/g'
 }
 
+# 源行是否已存在于任一 apk 源文件
+repo_line_present() {
+    for f in /etc/apk/repositories /etc/apk/repositories.d/*.list; do
+        [ -f "$f" ] && grep -qsxF "$1" "$f" && return 0
+    done
+    return 1
+}
+
+# 在所有源文件中把整行 $1 替换为 $2；有替换返回 0
+repo_line_replace() {
+    hit=1
+    for f in /etc/apk/repositories /etc/apk/repositories.d/*.list; do
+        [ -f "$f" ] && grep -qsxF "$1" "$f" || continue
+        awk -v o="$1" -v n="$2" '$0 == o { $0 = n } { print }' "$f" > "$f.tmp.$$" \
+            && cat "$f.tmp.$$" > "$f"
+        rm -f "$f.tmp.$$"
+        hit=0
+    done
+    return $hit
+}
+
 # 把快照里的第三方源加回当前配置
+# 源行可能带 apk 仓库标签，如 "@daeuniverse https://..."，整行原样处理
 restore_extra_repos() {
     [ -f "$REPOS_SNAPSHOT" ] || return 0
     target=/etc/apk/repositories
@@ -932,12 +962,17 @@ restore_extra_repos() {
             case "$u" in
                 *nikki*) need_nikki=1; continue ;;
             esac
-            # 其余源：先替换完整版本号，再替换分支号（两侧要求非数字，避免误伤别的数字）
+        fi
+        if [ "$REL_CHANGED" = 1 ]; then
             nv="$u"
+            # 小版本升级也要换完整版本号：kmods 源路径带完整版本号
+            # （如 .../25.12/kmods/25.12.0/...），不换就会装到与新内核不匹配的 kmod
             if [ -n "$OLD_REL" ] && [ -n "$DISTRIB_RELEASE" ]; then
                 nv=$(printf '%s' "$nv" | sed "s#$(sed_escape "$OLD_REL")#$DISTRIB_RELEASE#g")
             fi
-            if [ -n "$OLD_BRANCH" ] && [ -n "$NEW_BRANCH" ] && [ "$OLD_BRANCH" != "SNAPSHOT" ]; then
+            # 跨分支时再换分支号（两侧要求非数字，避免误伤别的数字）
+            if [ "$BRANCH_CHANGED" = 1 ] && [ -n "$OLD_BRANCH" ] && [ -n "$NEW_BRANCH" ] \
+                    && [ "$OLD_BRANCH" != "SNAPSHOT" ]; then
                 ob=$(sed_escape "$OLD_BRANCH")
                 nv=$(printf '%s' "$nv" | sed \
                     -e "s#\([^0-9.]\)$ob\([^0-9.]\)#\1$NEW_BRANCH\2#g" \
@@ -945,12 +980,17 @@ restore_extra_repos() {
             fi
             if [ "$nv" != "$u" ]; then
                 info "源地址已按新版本改写: $u -> $nv"
-            else
+                # 原文件若随 sysupgrade 保留下来（如 customfeeds.list），就地改写，避免新旧两行并存
+                if repo_line_replace "$u" "$nv"; then
+                    u="$nv"
+                    continue
+                fi
+            elif [ "$BRANCH_CHANGED" = 1 ]; then
                 warn "跨版本但源地址中未找到旧版本号，原样加回（可能仍指向旧分支）: $u"
             fi
             u="$nv"
         fi
-        grep -qsxF "$u" "$target" 2>/dev/null && continue
+        repo_line_present "$u" && continue
         printf '%s\n' "$u" >> "$target" && info "已恢复第三方源: $u"
     done < "$REPOS_SNAPSHOT"
 
@@ -972,10 +1012,13 @@ cache_thirdparty_apks() {
     kept=""
     for p in $(cat "$THIRD_LIST"); do
         mkdir -p "$staging/$p"
-        if apk fetch -o "$staging/$p" "$p" >/dev/null 2>&1 \
+        if apk fetch -o "$staging/$p" "$p" >/dev/null 2>"$TMP_DIR/fetch.err" \
                 && ls "$staging/$p"/*.apk >/dev/null 2>&1; then
             continue
         fi
+        # 失败原因写进日志，便于区分“源里没有”与“网络/签名问题”
+        printf '[fetch %s] %s\n' "$p" "$(head -n 2 "$TMP_DIR/fetch.err" 2>/dev/null | tr '\n' ' ')" \
+            >> "$LOG_FILE"
         rm -rf "$staging/$p"
         # 本次取不到：沿用上次该包的副本（只此一份，不会和新版本并存）
         if ls "$APK_CACHE/$p"/*.apk >/dev/null 2>&1; then
@@ -993,6 +1036,7 @@ cache_thirdparty_apks() {
     info "已离线备份 $got 个第三方包 -> $APK_CACHE"
 
     # 既下载不到、也没登记来源的包，升级后无法自动装回：如实列出
+    # （结果存入全局 UNKNOWN_PKGS，upgrade 据此拦截，避免升级后静默丢包）
     unknown=""
     for p in $(cat "$THIRD_LIST"); do
         ls "$APK_CACHE/$p"/*.apk >/dev/null 2>&1 && continue
@@ -1000,9 +1044,11 @@ cache_thirdparty_apks() {
         grep -qs " $p\$" "$SOURCES_FILE" && continue
         unknown="$unknown $p"
     done
+    UNKNOWN_PKGS="$unknown"
     if [ -n "$unknown" ]; then
         warn "以下第三方包来源未知，升级后无法自动装回:$unknown"
-        info "登记方式（一次即可）: echo 'owner/repo 包名' >> $SOURCES_FILE"
+        info "常见原因：所属第三方源已被移除（apk fetch 失败原因见 $LOG_FILE 中的 [fetch ...] 行）"
+        info "处理方式：重新添加该包的软件源；GitHub 包登记 echo 'owner/repo 包名' >> $SOURCES_FILE；不再需要的包直接 apk del"
     fi
 }
 
@@ -1062,10 +1108,11 @@ step_snapshot() {
     prune_github_cache
 
     # world = 显式安装的顶层包。还原只补这些，依赖交给 apk 解析，
-    # 否则会把旧依赖（可能已改名/被替代）也写进 world，越滚越脏
+    # 否则会把旧依赖（可能已改名/被替代）也写进 world，越滚越脏。
+    # 保留仓库标签（name@tag）：带标签源里的包只有按 name@tag 才能装上；只去掉版本约束
     if [ -r /etc/apk/world ]; then
         grep -Ev '^[[:space:]]*(#|$)' /etc/apk/world 2>/dev/null \
-            | sed 's/[<>=~@].*$//' | sort -u > "$WORLD_SNAPSHOT"
+            | sed 's/[<>=~][^@]*//' | sort -u > "$WORLD_SNAPSHOT"
         info "已记录 $(wc -l < "$WORLD_SNAPSHOT" | tr -d ' ') 个顶层包 -> $WORLD_SNAPSHOT"
     else
         : > "$WORLD_SNAPSHOT"
@@ -1114,6 +1161,12 @@ restore_offline_cache() {
             || warn "离线安装失败 ${f##*/}: $(head -n 2 "$TMP_DIR/apk.err" 2>/dev/null | tr '\n' ' ')"
     done
     return 0
+}
+
+# 输出清单 $1 中尚未安装的条目（按包名比对，条目可带 @tag，原样输出供 apk add 使用）
+missing_entries() {
+    awk 'NR == FNR { have[$0] = 1; next }
+         { n = $0; sub(/@.*/, "", n); if (n != "" && !(n in have)) print $0 }' "$2" "$1"
 }
 
 # 包是否还存在于当前已启用的任一软件源索引中
@@ -1184,7 +1237,7 @@ step_restore() {
 
     restored=0
     list_installed | sort -u > "$TMP_DIR/cur.txt"
-    missing=$(grep -vxF -f "$TMP_DIR/cur.txt" "$want" 2>/dev/null)
+    missing=$(missing_entries "$want" "$TMP_DIR/cur.txt")
     if [ -n "$missing" ]; then
         log "仍有 $(printf '%s\n' "$missing" | wc -l | tr -d ' ') 个包缺失，在线补齐"
         if apk add $missing >/dev/null 2>"$TMP_DIR/apk.err"; then
@@ -1204,14 +1257,15 @@ step_restore() {
     #    官方包在新版本里已被改名/移除（索引正常却查不到）属于永久性缺失，重试也没用，
     #    只告警不计失败；第三方包、GitHub 包或索引刷新失败时一律算失败，留给下次重试
     list_installed | sort -u > "$TMP_DIR/cur.txt"
-    still=$(grep -vxF -f "$TMP_DIR/cur.txt" "$want" 2>/dev/null)
+    still=$(missing_entries "$want" "$TMP_DIR/cur.txt")
     hard=""
     gone=""
     for p in $still; do
+        n="${p%%@*}"
         if [ "$idx_ok" = 1 ] \
-                && ! grep -qsxF "$p" "$THIRD_LIST" \
-                && ! grep -qs " $p\$" "$SOURCES_FILE" \
-                && ! pkg_available "$p"; then
+                && ! grep -qsxF "$n" "$THIRD_LIST" \
+                && ! grep -qs " $n\$" "$SOURCES_FILE" \
+                && ! pkg_available "$n"; then
             gone="$gone $p"
         else
             hard="$hard $p"
@@ -1301,6 +1355,14 @@ step_upgrade() {
 
     step_snapshot || { err "快照失败，已中止升级"; record_fail "upgrade"; return 1; }
     ensure_restore_files
+
+    # 有包既无离线副本、也无来源：升级后必然丢失，默认拦截
+    if [ -n "$UNKNOWN_PKGS" ] && [ "${ALLOW_LOSS:-0}" != "1" ]; then
+        err "以下第三方包升级后无法装回，已中止升级:$UNKNOWN_PKGS"
+        info "补齐来源或卸载这些包后重试；确认可以丢弃时执行: ALLOW_LOSS=1 sh $0 upgrade"
+        record_fail "upgrade"
+        return 1
+    fi
 
     # 兜底：标记放在保留目录里，即使 owut 不支持 -I 也能在升级后触发还原
     # （服务文件与 rc.d 自启链接已登记进 sysupgrade.conf）。

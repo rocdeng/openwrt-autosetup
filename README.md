@@ -80,6 +80,7 @@ autosetup upgrade
 
 内部顺序：
 
+0. **拦截**：若有第三方包既无离线副本、也无登记来源（升级后必然丢失），默认中止升级并列出包名；确认可以丢弃时用 `ALLOW_LOSS=1 autosetup upgrade`
 1. **快照**：已装包清单 → `pkgs.snapshot`；识别第三方包 → `thirdparty.list`；第三方源行 → `repos.snapshot`；签名公钥 → `keys/`；第三方包 apk → `apk-cache/`
 2. **剔除**：把 `thirdparty.list` 现算成 `owut upgrade -r <包名...>`
 3. **升级**：`owut upgrade -r ... -I /etc/autosetup/asu-defaults.sh --progress-size 1000`（构建 → 下载 → 校验 → 刷机 → 重启）
