@@ -160,6 +160,7 @@ echo '0 4 * * 6 /bin/sh /etc/autosetup/setup.sh upgrade >> /etc/autosetup/cron.l
 | ASU 下载慢 | `sysupgrade.openwrt.org` 的 store 节点在国内常被限速 | 可换服务器：`uci set attendedsysupgrade.server.url='https://sysupgrade.guerra24.net'` |
 | `-I` 上传的脚本 | 内容会发到构建服务器，可从构建哈希公开下载 | 该文件只置标记、不含凭据，切勿往里放密码 |
 | 官方镜像构建时长 | ASU 排队+构建通常 2–5 分钟 | 正常现象 |
+| 备份体积 | `/etc/autosetup` 会整体进 sysupgrade 备份包，而该包在 `/tmp`（内存）中生成 | 小内存设备（64–128MB）若第三方包很多，可先 `du -sh /etc/autosetup` 确认；必要时删 `apk-cache/` 只保留在线还原 |
 
 ## 8. 故障排查（都是实测踩过的）
 
