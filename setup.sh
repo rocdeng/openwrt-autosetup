@@ -1302,11 +1302,12 @@ step_restore() {
     missing=$(missing_entries "$want" "$TMP_DIR/cur.txt")
     if [ -n "$missing" ]; then
         log "仍有 $(printf '%s\n' "$missing" | wc -l | tr -d ' ') 个包缺失，在线补齐"
-        if apk add $missing >/dev/null 2>"$TMP_DIR/apk.err"; then
+        # 不丢弃 stdout：依赖可能很大（如 mihomo 内核 20MB+），进度写进日志才看得出没卡死
+        if apk add $missing 2>"$TMP_DIR/apk.err"; then
             restored=$(printf '%s\n' "$missing" | wc -l | tr -d ' ')
         else
             for p in $missing; do
-                if apk add "$p" >/dev/null 2>"$TMP_DIR/apk.err"; then
+                if apk add "$p" 2>"$TMP_DIR/apk.err"; then
                     restored=$((restored + 1))
                 else
                     warn "安装失败 $p: $(head -n 2 "$TMP_DIR/apk.err" 2>/dev/null | tr '\n' ' ')"
