@@ -120,10 +120,12 @@ DNS 失败时 `configure_dns` 将 DNS 列表（默认网关 + 223.5.5.5、119.29
 3. **来源登记** `/etc/autosetup/sources.list`（`owner/repo 包名`）：只用于 GitHub 这类任何 feed 都没有的包；`github_install` 安装成功后自动登记，因此以后新装的包无需人工维护。
 4. **升级编排** `step_upgrade`：先快照/备份（含第三方源行 `repos.snapshot`），再由 `thirdparty.list` 动态生成 `owut upgrade -r <包名...>`（清单来自已装数据库，故用纯包名；旧版 owut 不认 `/if-installed` 后缀），并挂上 `-I`（随镜像下发的 uci-defaults）与 `--progress-size`（显示下载进度）。**不使用 owut 的 `-p/--pre-install`**：该钩子经 `ubus call file exec` 执行且有超时，快照要跑 `apk list`/`apk fetch`，实测直接 `Request timed out`；快照在 upgrade 步骤开头已完成，无需重复。
 5. **首启还原** `step_restore`，由 procd 服务在开机后触发：
-   - 按 `repos.snapshot` 把升级前的第三方源行**原样加回** `/etc/apk/repositories` 并刷新索引（不依赖任何具体 feed 脚本，与 Nikki 等具体源无关）；
+   - 先补回 `/etc/apk/keys` 里第三方源的**签名公钥**（同样不在 sysupgrade 白名单，丢了会报 `UNTRUSTED signature`），再按 `repos.snapshot` 把升级前的第三方源行**原样加回** `/etc/apk/repositories`，然后刷新索引（不依赖任何具体 feed 脚本，与 Nikki 等具体源无关）；
    - 优先用 `apk add --allow-untrusted /etc/autosetup/apk-cache/*.apk` 离线装回（版本与升级前一致）；
    - 再用快照差集在线补齐其余缺失；
    - 最后按 `sources.list` 重装 GitHub 类包。
+
+**持久化前提（关键）**：OpenWrt 的 `sysupgrade` 只保留白名单路径（`/etc/config`、`/etc/sysupgrade.conf`、`/etc/apk/repositories` 等），**自定义目录默认不保留**。因此 `step_snapshot` 每次都会把 `/etc/autosetup` 写进 `/etc/sysupgrade.conf`；否则升级后清单、离线缓存、标记全部丢失，还原层无据可依（实测踩过：清单丢失 → 静默不恢复）。
 
 **钩子说明**：`--init-script` 的脚本会被放进镜像 `/etc/uci-defaults/99-asu-defaults`，内容会上传构建服务器且可从构建哈希公开下载，因此里面**不能有凭据**；它只负责置一个标记。真正的重活由 `/etc/init.d/autosetup` 在开机后等外网可达时执行，失败保留标记、下次开机重试。
 
@@ -210,6 +212,7 @@ openwrt-after-upgrade/
 /etc/autosetup/restore-boot.sh    # 首启还原包装（等外网可达）
 /etc/autosetup/pkgs.snapshot      # 升级前已装包清单
 /etc/autosetup/repos.snapshot     # 升级前的第三方源行
+/etc/autosetup/keys/              # 第三方源的签名公钥备份
 /etc/autosetup/thirdparty.list    # 自动识别出的第三方包
 /etc/autosetup/apk-cache/         # 第三方包的 apk 离线备份
 /etc/autosetup/sources.list       # 只能从 GitHub 获取的包的来源登记

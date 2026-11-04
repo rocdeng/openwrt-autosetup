@@ -16,6 +16,7 @@ PKG_SNAPSHOT="$CONF_DIR/pkgs.snapshot"
 THIRD_LIST="$CONF_DIR/thirdparty.list"
 REPOS_SNAPSHOT="$CONF_DIR/repos.snapshot"
 APK_CACHE="$CONF_DIR/apk-cache"
+KEYS_DIR="$CONF_DIR/keys"
 SOURCES_FILE="$CONF_DIR/sources.list"
 OWUT_INIT="/etc/owut.d/asu-defaults.sh"
 PKG_DB="/lib/apk/db/installed"
@@ -814,6 +815,37 @@ register_source() {
     printf '%s %s\n' "$repo" "$name" >> "$SOURCES_FILE"
 }
 
+# sysupgrade 只保留白名单里的路径，自定义目录必须显式登记，否则固件一升就没了
+ensure_keep_entry() {
+    conf=/etc/sysupgrade.conf
+    grep -qs '^/etc/autosetup/*$' "$conf" 2>/dev/null && return 0
+    mkdir -p "$CONF_DIR" 2>/dev/null
+    if printf '/etc/autosetup\n' >> "$conf" 2>/dev/null; then
+        info "已将 $CONF_DIR 加入 $conf（随固件升级保留）"
+    else
+        warn "写入 $conf 失败，还原层的清单可能无法跨固件保留"
+    fi
+}
+
+# 第三方源的签名公钥也在 /etc/apk/keys，同样不在 sysupgrade 白名单里，一并备份
+snapshot_apk_keys() {
+    mkdir -p "$KEYS_DIR" 2>/dev/null || return 0
+    cp -f /etc/apk/keys/*.pem "$KEYS_DIR"/ 2>/dev/null
+    n=$(ls "$KEYS_DIR" 2>/dev/null | wc -l | tr -d ' ')
+    [ "$n" -gt 0 ] && info "已备份 $n 个 apk 签名公钥 -> $KEYS_DIR"
+}
+
+restore_apk_keys() {
+    [ -d "$KEYS_DIR" ] || return 0
+    mkdir -p /etc/apk/keys 2>/dev/null
+    for k in "$KEYS_DIR"/*; do
+        [ -f "$k" ] || continue
+        b=${k##*/}
+        [ -f "/etc/apk/keys/$b" ] && continue
+        cp -f "$k" "/etc/apk/keys/$b" && info "已恢复签名公钥: $b"
+    done
+}
+
 # 记录第三方源行（官方源之外的全部），升级后原样加回——不依赖任何具体 feed 脚本
 snapshot_extra_repos() {
     : > "$REPOS_SNAPSHOT" 2>/dev/null || return 1
@@ -869,6 +901,7 @@ step_snapshot() {
         return 1
     fi
     mkdir -p "$CONF_DIR" || { err "无法创建 $CONF_DIR"; record_fail "snapshot"; return 1; }
+    ensure_keep_entry
     if ! printf '%s\n' "$names" > "$PKG_SNAPSHOT"; then
         err "写入清单失败: $PKG_SNAPSHOT"
         record_fail "snapshot"
@@ -900,6 +933,7 @@ step_snapshot() {
         fi
     fi
     snapshot_extra_repos
+    snapshot_apk_keys
 }
 
 # 按 sources.list 重装无法从 feed 取得的包（GitHub Release 等）
@@ -938,7 +972,8 @@ step_restore() {
         return 1
     fi
 
-    # 1) 第三方源按升级前的快照加回（与具体 feed 无关），再刷新索引
+    # 1) 先补回第三方源及其签名公钥，再加源、刷索引
+    restore_apk_keys
     restore_extra_repos
     apk_update_force || warn "软件索引刷新失败，仍继续尝试恢复"
 
@@ -967,7 +1002,12 @@ step_restore() {
             fi
         fi
     else
-        warn "未找到升级前清单 $PKG_SNAPSHOT，跳过包恢复"
+        # 清单缺失说明还原层没被保留（例如 /etc/autosetup 未登记进 /etc/sysupgrade.conf），
+        # 这不是“无需恢复”，必须如实报失败，否则会静默丢包
+        err "未找到升级前清单 $PKG_SNAPSHOT，无法判断要装回哪些包"
+        info "检查 /etc/sysupgrade.conf 是否包含 /etc/autosetup，或重跑 restore-install.sh"
+        record_fail "restore"
+        return 1
     fi
 
     # 4) 无法从 feed 取得的包，按登记的来源重装
