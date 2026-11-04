@@ -147,3 +147,9 @@
 - [x] **源行仍被打印到终端**：上一轮的 `sort -u -o F F` 修复无效。OpenWrt 的 BusyBox 没有启用 `FEATURE_SORT_BIG`，它接受 `-o` 参数但会直接忽略，结果仍然输出到 stdout，文件也不去重。现在改为先写临时文件，再 `mv` 覆盖。
 - [x] **GitHub 类包被列在"源里取不到"里**，看起来像备份出了问题。现在单独归为一类，并提示其中哪些还没有离线副本。
 - [ ] 设备侧：`chinadns-ng`、`dns2socks`、`shadowsocksr-libev-ssr-local`、`tcping` 仍然来源未知，`upgrade` 会被拦截。
+
+## 十、第六轮：`FORCE=1 ... argon` 文件归属冲突
+
+- [x] Argon 3.x 把配置工具的文件（`/etc/config/argon`、rpcd、菜单、ACL、`argon-config.js`）并进了主题包，`luci-app-argon-config` 3.x 只剩一个 848 字节的空壳。旧版本是先单独升级主题，这时文件仍归旧的 `luci-app-argon-config` 1.0 所有，于是报 `trying to overwrite ... owned by`。
+- [x] 修复：`github_install` 支持同一仓库传入多个包，所有 apk 放进同一个 `apk add` 事务，由 apk 处理文件归属的转移。`step_argon` 和 `restore_sources`（按仓库分组）都改为一次性安装。离线还原本来就是同一个事务，不受影响。
+- [ ] 设备侧：主题包处于"1 error"状态，需要用新脚本 `FORCE=1 sh /etc/autosetup/setup.sh argon` 重装一次，或者执行 `apk fix luci-theme-argon`。

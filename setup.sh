@@ -325,39 +325,55 @@ pick_apk() {
     done | head -n 1
 }
 
-install_apk_url() {
-    url="$1"; name="${2:-}"
-    out="$TMP_DIR/${url##*/}"
-    log "下载 apk: $url"
-    dl_gh "$url" "$out" || return 1
-    log "安装（自动解析依赖）: ${url##*/}"
-    apk add --allow-untrusted "$out" || return 1
-    if [ -n "$name" ] && ! is_installed "$name"; then
-        err "安装校验失败：${url##*/} 安装后本地未检测到 $name"
-        return 1
-    fi
-    info "安装成功: ${url##*/}"
-    # 另存一份到保留目录：GitHub 类包不在任何 feed，离线时只能靠这份副本。
-    # 按包名分目录且每次替换整个目录，保证每个包只留一个版本（多版本并存会导致降级）
-    if [ -n "$name" ]; then
+# 从同一个仓库安装一个或多个包，所有 apk 放进同一个 apk add 事务。
+# 同仓库的包之间可能转移文件归属（如 Argon 3.x 把配置工具的文件并进了主题包），
+# 分开安装会因“trying to overwrite ... owned by”失败，同一事务内 apk 能正确处理
+github_install() {
+    repo="$1"; shift
+    todo=""
+    for name in "$@"; do
+        if is_installed "$name" && [ "$FORCE" != "1" ]; then
+            info "$name 已安装，跳过（FORCE=1 可强制重装）"
+            continue
+        fi
+        todo="$todo $name"
+    done
+    [ -n "$todo" ] || return 0
+
+    assets=$(get_assets "$repo") || { err "无法获取 $repo 的发布信息（可尝试 -p  指定镜像）"; return 1; }
+    files=""
+    for name in $todo; do
+        url=$(pick_apk "$assets" "$name")
+        [ -n "$url" ] || { err "$repo 未找到 $name 的 apk 包"; return 1; }
+        out="$TMP_DIR/${url##*/}"
+        log "下载 apk: $url"
+        dl_gh "$url" "$out" || { err "下载失败: $url"; return 1; }
+        files="$files $out"
+    done
+
+    log "安装（自动解析依赖）:$todo"
+    # shellcheck disable=SC2086
+    apk add --allow-untrusted $files || { err "apk 安装失败:$todo"; return 1; }
+
+    gi_rc=0
+    set -- $files
+    for name in $todo; do
+        out="$1"; shift
+        if ! is_installed "$name"; then
+            err "安装校验失败：${out##*/} 安装后本地未检测到 $name"
+            gi_rc=1
+            continue
+        fi
+        info "安装成功: ${out##*/}"
+        # 另存一份到保留目录：GitHub 类包不在任何 feed，离线时只能靠这份副本。
+        # 按包名分目录且每次替换整个目录，保证每个包只留一个版本（多版本并存会导致降级）
         rm -rf "$GH_CACHE/$name"
         mkdir -p "$GH_CACHE/$name" 2>/dev/null \
             && cp -f "$out" "$GH_CACHE/$name/" 2>/dev/null
-    fi
-}
-
-github_install() {
-    repo="$1"; name="$2"
-    if is_installed "$name" && [ "$FORCE" != "1" ]; then
-        info "$name 已安装，跳过（FORCE=1 可强制重装）"
-        return 0
-    fi
-    assets=$(get_assets "$repo") || { err "无法获取 $repo 的发布信息（可尝试 -p  指定镜像）"; return 1; }
-    url=$(pick_apk "$assets" "$name")
-    [ -n "$url" ] || { err "$repo 未找到 $name 的 apk 包"; return 1; }
-    install_apk_url "$url" "$name" || return 1
-    # 登记来源：这类包不在任何 feed 里，升级后只能按此记录重装
-    register_source "$repo" "$name"
+        # 登记来源：这类包不在任何 feed 里，升级后只能按此记录重装
+        register_source "$repo" "$name"
+    done
+    return $gi_rc
 }
 
 if [ "$FLAVOR" = "immortal" ]; then
@@ -762,10 +778,8 @@ step_argon() {
     section "步骤 4/5 安装 Argon 主题及配置工具"
     ensure_network || { err "网络未就绪，终止本步骤"; record_fail "argon"; return 1; }
     apk_update || { record_fail "argon"; return 1; }
-    github_install "jerrykuku/luci-theme-argon" "luci-theme-argon" \
-        || record_fail "argon"
-    # 配置工具的 apk 与主题同仓库发布（独立配置仓库仅提供 ipk）
-    github_install "jerrykuku/luci-theme-argon" "luci-app-argon-config" \
+    # 配置工具的 apk 与主题同仓库发布（独立配置仓库仅提供 ipk）；两者必须同一事务安装
+    github_install "jerrykuku/luci-theme-argon" "luci-theme-argon" "luci-app-argon-config" \
         || record_fail "argon"
 
     if is_installed luci-theme-argon; then
@@ -1162,16 +1176,22 @@ step_snapshot() {
 }
 
 # 按 sources.list 重装无法从 feed 取得的包（GitHub Release 等）
+# 同一仓库的包合并成一次安装（见 github_install 的说明）
 restore_sources() {
     [ -f "$SOURCES_FILE" ] || return 0
-    rc=0
-    while read -r repo name rest; do
-        case "$repo" in ''|'#'*) continue ;; esac
-        [ -n "$name" ] || continue
-        is_installed "$name" && [ "$FORCE" != "1" ] && continue
-        github_install "$repo" "$name" || rc=1
-    done < "$SOURCES_FILE"
-    return $rc
+    rs_rc=0
+    rs_repos=$(awk '$1 !~ /^#/ && NF >= 2 { print $1 }' "$SOURCES_FILE" | awk '!seen[$0]++')
+    for rs_repo in $rs_repos; do
+        rs_names=""
+        for rs_name in $(awk -v r="$rs_repo" '$1 == r && NF >= 2 { print $2 }' "$SOURCES_FILE"); do
+            is_installed "$rs_name" && [ "$FORCE" != "1" ] && continue
+            rs_names="$rs_names $rs_name"
+        done
+        [ -n "$rs_names" ] || continue
+        # shellcheck disable=SC2086
+        github_install "$rs_repo" $rs_names || rs_rc=1
+    done
+    return $rs_rc
 }
 
 # 优先用升级前的 apk 缓存离线还原（版本与升级前一致）
