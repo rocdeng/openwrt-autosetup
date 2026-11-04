@@ -140,15 +140,15 @@ chmod 755 "$CONF/init.d-autosetup"
 ln -sf "$CONF/setup.sh" /usr/bin/autosetup 2>/dev/null
 
 # ---- 6. 配置 owut：只挂两个钩子（剔除名单由 setup.sh 每次升级前自动生成）----
-uci -q get attendedsysupgrade.owut >/dev/null 2>&1 || uci set attendedsysupgrade.owut=owut
-uci set attendedsysupgrade.owut.init_script="$CONF/asu-defaults.sh"
+uci -q get attendedsysupgrade.owut >/dev/null 2>&1 || uci set attendedsysupgrade.owut=owut || true
+uci set attendedsysupgrade.owut.init_script="$CONF/asu-defaults.sh" || true
 rm -f "$OWUT_D/asu-defaults.sh"   # 旧位置不在白名单，弃用
 rm -f "$CONF/asu-defaults.sh"     # 由 setup.sh snapshot 重新生成，避免两份实现漂移
 # 不用 pre_install：owut 经 ubus file exec 调用且有超时，快照由 upgrade 步骤自己完成
-uci -q delete attendedsysupgrade.owut.pre_install
+uci -q delete attendedsysupgrade.owut.pre_install || true
 rm -f "$CONF/pre-install.sh"
-uci -q delete attendedsysupgrade.owut.remove
-uci commit attendedsysupgrade
+uci -q delete attendedsysupgrade.owut.remove || true
+uci commit attendedsysupgrade || true
 info "已配置 owut：init_script（不使用 pre_install 钩子）"
 
 # ---- 7. 立刻快照一次，保证第一次升级就有清单与备份 ----

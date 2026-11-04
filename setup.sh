@@ -17,6 +17,9 @@ THIRD_LIST="$CONF_DIR/thirdparty.list"
 REPOS_SNAPSHOT="$CONF_DIR/repos.snapshot"
 APK_CACHE="$CONF_DIR/apk-cache"
 KEYS_DIR="$CONF_DIR/keys"
+WORLD_SNAPSHOT="$CONF_DIR/world.snapshot"
+RELEASE_MARK="$CONF_DIR/release.snapshot"
+GH_CACHE="$CONF_DIR/github-cache"
 SOURCES_FILE="$CONF_DIR/sources.list"
 # init-script 与服务工作副本都放在 /etc/autosetup 下：只有这个目录被登记进
 # /etc/sysupgrade.conf，升级后仍然存在
@@ -210,7 +213,7 @@ http_location() {
 # GitHub 加速前缀：默认使用内置镜像依次回退；--direct 才在末尾尝试直连
 GH_MIRRORS="https://gh-proxy.com https://ghfast.top https://ghproxy.net"
 GH_PREFIX=""
-DIRECT=0
+DIRECT="${DIRECT:-0}"
 
 gh_prefixes() {
     if [ -n "$GITHUB_PROXY" ]; then
@@ -307,6 +310,9 @@ install_apk_url() {
         return 1
     fi
     info "安装成功: ${url##*/}"
+    # 另存一份到保留目录：GitHub 类包不在任何 feed，离线时只能靠这份副本
+    mkdir -p "$GH_CACHE" 2>/dev/null
+    cp -f "$out" "$GH_CACHE/${url##*/}" 2>/dev/null
 }
 
 github_install() {
@@ -803,7 +809,10 @@ thirdparty_packages() {
         NR == FNR { want[$0] = 1; next }
         {
             for (n in want)
-                if (index($0, n "-") == 1 || $0 == n) found[n] = 1
+                if (index($0, n "-") == 1) {
+                    # 必须是 "name-<数字>"，否则 foo 会被 foo-extra 误判为官方包
+                    if (substr($0, length(n) + 2) ~ /^[0-9]/) found[n] = 1
+                } else if ($0 == n) found[n] = 1
         }
         END { for (n in want) if (!(n in found)) print n }
     ' "$TMP_DIR/installed.txt" "$TMP_DIR/official.pkgs" | sort
@@ -820,13 +829,14 @@ register_source() {
 # sysupgrade 只保留白名单里的路径，自定义目录必须显式登记，否则固件一升就没了
 ensure_keep_entry() {
     conf=/etc/sysupgrade.conf
-    grep -qs '^/etc/autosetup/*$' "$conf" 2>/dev/null && return 0
     mkdir -p "$CONF_DIR" 2>/dev/null
-    if printf '/etc/autosetup\n' >> "$conf" 2>/dev/null; then
-        info "已将 $CONF_DIR 加入 $conf（随固件升级保留）"
-    else
-        warn "写入 $conf 失败，还原层的清单可能无法跨固件保留"
-    fi
+    added=""
+    for p in "$CONF_DIR" /etc/init.d/autosetup; do
+        grep -qs "^$p/*\$" "$conf" 2>/dev/null && continue
+        printf '%s\n' "$p" >> "$conf" 2>/dev/null && added="$added $p"
+    done
+    [ -n "$added" ] && info "已加入 $conf 保留清单:$added"
+    return 0
 }
 
 # 第三方源的签名公钥也在 /etc/apk/keys，同样不在 sysupgrade 白名单里，一并备份
@@ -865,8 +875,16 @@ snapshot_extra_repos() {
 restore_extra_repos() {
     [ -f "$REPOS_SNAPSHOT" ] || return 0
     target=/etc/apk/repositories
+    old_rel=$(cut -d' ' -f2 "$RELEASE_MARK" 2>/dev/null)
+    new_rel="${DISTRIB_RELEASE:-}"
     while read -r u; do
         [ -n "$u" ] || continue
+        # 跨版本时把旧版本号改写成当前版本，避免回放旧分支的源
+        if [ -n "$old_rel" ] && [ -n "$new_rel" ] && [ "$old_rel" != "$new_rel" ]; then
+            nv=$(printf '%s' "$u" | sed "s#$old_rel#$new_rel#g")
+            [ "$nv" != "$u" ] && info "源地址已按新版本改写: $u -> $nv"
+            u="$nv"
+        fi
         grep -qsxF "$u" "$target" 2>/dev/null && continue
         printf '%s\n' "$u" >> "$target" && info "已恢复第三方源: $u"
     done < "$REPOS_SNAPSHOT"
@@ -875,10 +893,15 @@ restore_extra_repos() {
 # 升级前把第三方包本身的 apk 文件缓存下来（版本锁定、离线可还原）
 cache_thirdparty_apks() {
     [ -s "$THIRD_LIST" ] || return 0
-    mkdir -p "$APK_CACHE" || return 1
-    rm -f "$APK_CACHE"/*.apk 2>/dev/null
-    apk fetch -o "$APK_CACHE" $(cat "$THIRD_LIST") >/dev/null 2>&1
-    got=$(ls "$APK_CACHE"/*.apk 2>/dev/null | wc -l | tr -d ' ')
+    staging="$APK_CACHE.new"
+    rm -rf "$staging"
+    mkdir -p "$staging" || return 1
+    # 先把旧缓存搬进 staging：本次下载失败的包仍保留上次的副本
+    [ -d "$APK_CACHE" ] && cp -f "$APK_CACHE"/*.apk "$staging"/ 2>/dev/null
+    apk fetch -o "$staging" $(cat "$THIRD_LIST") >/dev/null 2>&1
+    got=$(ls "$staging"/*.apk 2>/dev/null | wc -l | tr -d ' ')
+    rm -rf "$APK_CACHE"
+    mv "$staging" "$APK_CACHE"
     info "已离线备份 $got 个第三方包 -> $APK_CACHE"
 
     # 既下载不到、也没登记来源的包，升级后无法自动装回：如实列出
@@ -936,6 +959,19 @@ step_snapshot() {
     fi
     snapshot_extra_repos
     snapshot_apk_keys
+
+    # world = 显式安装的顶层包。还原只补这些，依赖交给 apk 解析，
+    # 否则会把旧依赖（可能已改名/被替代）也写进 world，越滚越脏
+    if [ -r /etc/apk/world ]; then
+        grep -Ev '^[[:space:]]*(#|$)' /etc/apk/world 2>/dev/null \
+            | sed 's/[<>=~].*$//' | sort -u > "$WORLD_SNAPSHOT"
+        info "已记录 $(wc -l < "$WORLD_SNAPSHOT" | tr -d ' ') 个顶层包 -> $WORLD_SNAPSHOT"
+    else
+        : > "$WORLD_SNAPSHOT"
+        warn "未找到 /etc/apk/world，将按完整已装清单还原（可能把依赖写成顶层包）"
+    fi
+    printf '%s %s\n' "${DISTRIB_ID:-unknown}" "${DISTRIB_RELEASE:-unknown}" > "$RELEASE_MARK"
+
     ensure_restore_files
 }
 
@@ -954,15 +990,18 @@ restore_sources() {
 
 # 优先用升级前的 apk 缓存离线还原（版本与升级前一致）
 restore_offline_cache() {
-    set -- "$APK_CACHE"/*.apk
-    [ -f "$1" ] || return 0
-    log "从离线缓存安装 $# 个 apk（版本与升级前一致）"
-    if apk add --allow-untrusted "$@" >/dev/null 2>"$TMP_DIR/apk.err"; then
-        return 0
-    fi
-    for f in "$@"; do
-        apk add --allow-untrusted "$f" >/dev/null 2>"$TMP_DIR/apk.err" \
-            || warn "离线安装失败 ${f##*/}: $(head -n 2 "$TMP_DIR/apk.err" 2>/dev/null | tr '\n' ' ')"
+    for dir in "$GH_CACHE" "$APK_CACHE"; do
+        [ -d "$dir" ] || continue
+        set -- "$dir"/*.apk
+        [ -f "$1" ] || continue
+        log "从离线缓存安装 $# 个 apk（$dir）"
+        if apk add --allow-untrusted "$@" >/dev/null 2>"$TMP_DIR/apk.err"; then
+            continue
+        fi
+        for f in "$@"; do
+            apk add --allow-untrusted "$f" >/dev/null 2>"$TMP_DIR/apk.err" \
+                || warn "离线安装失败 ${f##*/}: $(head -n 2 "$TMP_DIR/apk.err" 2>/dev/null | tr '\n' ' ')"
+        done
     done
     return 0
 }
@@ -975,53 +1014,68 @@ step_restore() {
         return 1
     fi
 
-    # 1) 先补回第三方源及其签名公钥，再加源、刷索引
+    # 版本是否变化：跨分支时离线缓存与旧源都不可靠
+    ver_changed=0
+    if [ -f "$RELEASE_MARK" ]; then
+        old_rel=$(cat "$RELEASE_MARK" 2>/dev/null)
+        cur_rel="${DISTRIB_ID:-unknown} ${DISTRIB_RELEASE:-unknown}"
+        [ "$old_rel" != "$cur_rel" ] && ver_changed=1
+        [ "$ver_changed" = 1 ] && warn "系统版本已变化（$old_rel -> $cur_rel）"
+    fi
+
+    # 1) 补回公钥 → 加回源 → 刷索引
     restore_apk_keys
     restore_extra_repos
     apk_update_force || warn "软件索引刷新失败，仍继续尝试恢复"
 
-    # 2) 离线缓存优先（版本锁定）
-    restore_offline_cache
-
-    # 3) 与升级前清单比对，补齐其余缺失（来自 feed 的包）
-    restored=0
-    bad_pkgs=""
-    if [ -f "$PKG_SNAPSHOT" ]; then
-        list_installed | sort -u > "$TMP_DIR/cur.txt"
-        missing=$(grep -vxF -f "$TMP_DIR/cur.txt" "$PKG_SNAPSHOT" 2>/dev/null)
-        if [ -n "$missing" ]; then
-            log "仍有 $(printf '%s\n' "$missing" | wc -l | tr -d ' ') 个包缺失，在线补齐"
-            if apk add $missing >/dev/null 2>"$TMP_DIR/apk.err"; then
-                restored=$(printf '%s\n' "$missing" | wc -l | tr -d ' ')
-            else
-                for p in $missing; do
-                    if apk add "$p" >/dev/null 2>"$TMP_DIR/apk.err"; then
-                        restored=$((restored + 1))
-                    else
-                        bad_pkgs="$bad_pkgs $p"
-                        warn "安装失败 $p: $(head -n 2 "$TMP_DIR/apk.err" 2>/dev/null | tr '\n' ' ')"
-                    fi
-                done
-            fi
-        fi
+    # 2) 离线缓存（仅在同一版本内使用，避免装入旧 ABI 的二进制）
+    if [ "$ver_changed" = 1 ]; then
+        warn "跨版本升级，跳过离线缓存，改用在线安装"
     else
-        # 清单缺失说明还原层没被保留（例如 /etc/autosetup 未登记进 /etc/sysupgrade.conf），
-        # 这不是“无需恢复”，必须如实报失败，否则会静默丢包
-        err "未找到升级前清单 $PKG_SNAPSHOT，无法判断要装回哪些包"
+        restore_offline_cache
+    fi
+
+    # 3) 不在任何 feed 里的包（GitHub Release）先装：
+    #    否则它们会在下面的差集里被判为“装不上”，导致永远失败
+    restore_sources || warn "部分 GitHub 类包未能重装"
+
+    # 4) 按顶层包差集在线补齐（无 world 清单时退回完整已装清单）
+    want="$PKG_SNAPSHOT"
+    [ -s "$WORLD_SNAPSHOT" ] && want="$WORLD_SNAPSHOT"
+    if [ ! -f "$want" ]; then
+        err "未找到清单（$want），无法判断要装回哪些包"
         info "检查 /etc/sysupgrade.conf 是否包含 /etc/autosetup，或重跑 restore-install.sh"
         record_fail "restore"
         return 1
     fi
 
-    # 4) 无法从 feed 取得的包，按登记的来源重装
-    restore_sources || bad_pkgs="$bad_pkgs <sources.list 中的包>"
+    restored=0
+    list_installed | sort -u > "$TMP_DIR/cur.txt"
+    missing=$(grep -vxF -f "$TMP_DIR/cur.txt" "$want" 2>/dev/null)
+    if [ -n "$missing" ]; then
+        log "仍有 $(printf '%s\n' "$missing" | wc -l | tr -d ' ') 个包缺失，在线补齐"
+        if apk add $missing >/dev/null 2>"$TMP_DIR/apk.err"; then
+            restored=$(printf '%s\n' "$missing" | wc -l | tr -d ' ')
+        else
+            for p in $missing; do
+                if apk add "$p" >/dev/null 2>"$TMP_DIR/apk.err"; then
+                    restored=$((restored + 1))
+                else
+                    warn "安装失败 $p: $(head -n 2 "$TMP_DIR/apk.err" 2>/dev/null | tr '\n' ' ')"
+                fi
+            done
+        fi
+    fi
 
-    if [ -n "$bad_pkgs" ]; then
-        warn "以下软件未能恢复，可能源里已不存在:$bad_pkgs"
+    # 5) 最终以“实际装上了没有”判定成败，而不是中间步骤的报错
+    list_installed | sort -u > "$TMP_DIR/cur.txt"
+    still=$(grep -vxF -f "$TMP_DIR/cur.txt" "$want" 2>/dev/null | tr '\n' ' ')
+    if [ -n "$still" ]; then
+        warn "以下包仍未恢复，可能源里已不存在:$still"
         record_fail "restore"
         return 1
     fi
-    info "恢复完成：在线补装 $restored 个包"
+    info "恢复完成：本次补装 $restored 个包"
 }
 
 # 服务与 init-script 都不在 sysupgrade 白名单里，升级后会消失；
@@ -1086,8 +1140,17 @@ step_upgrade() {
         || { err "未找到 owut（OpenWrt 25.12 起预装，旧版执行: apk add owut）"; record_fail "upgrade"; return 1; }
     ensure_network || { err "网络未就绪，终止升级"; record_fail "upgrade"; return 1; }
 
+    # 重启后 apk 索引缓存在 /tmp 里已清空，先刷新；
+    # 失败不中止——识别逻辑会沿用上次的清单，owut 会用明确报错兜底
+    info "刷新软件索引"
+    apk_update_force || warn "索引刷新失败（识别可能沿用上次结果）"
+
     step_snapshot || { err "快照失败，已中止升级"; record_fail "upgrade"; return 1; }
     ensure_restore_files
+
+    # 兜底：标记放在保留目录里，即使 owut 不支持 -I 也能在升级后触发还原；
+    # 若本次升级最终没刷机，下次开机会跑一次 restore 并以“无需恢复”结束，无副作用
+    : > "$CONF_DIR/restore.flag" 2>/dev/null && info "已预置还原标记 restore.flag"
 
     remove_list=""
     if [ -s "$THIRD_LIST" ]; then

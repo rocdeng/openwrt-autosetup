@@ -160,6 +160,7 @@ echo '0 4 * * 6 /bin/sh /etc/autosetup/setup.sh upgrade >> /etc/autosetup/cron.l
 | ASU 下载慢 | `sysupgrade.openwrt.org` 的 store 节点在国内常被限速 | 可换服务器：`uci set attendedsysupgrade.server.url='https://sysupgrade.guerra24.net'` |
 | `-I` 上传的脚本 | 内容会发到构建服务器，可从构建哈希公开下载 | 该文件只置标记、不含凭据，切勿往里放密码 |
 | 官方镜像构建时长 | ASU 排队+构建通常 2–5 分钟 | 正常现象 |
+| OpenClash 内核可选保留 | `/etc/openclash/core/` 加进 `/etc/sysupgrade.conf` 即可跨升级保留，省掉手工下载 | 内核常 50–100MB，会打进内存中的备份包；小内存别加，建议维持手工下载 |
 | 备份体积 | `/etc/autosetup` 会整体进 sysupgrade 备份包，而该包在 `/tmp`（内存）中生成 | 小内存设备（64–128MB）若第三方包很多，可先 `du -sh /etc/autosetup` 确认；必要时删 `apk-cache/` 只保留在线还原 |
 
 ## 8. 故障排查（都是实测踩过的）
@@ -180,7 +181,10 @@ echo '0 4 * * 6 /bin/sh /etc/autosetup/setup.sh upgrade >> /etc/autosetup/cron.l
 | 路径 | 作用 |
 |---|---|
 | `/etc/autosetup/setup.sh` | 主脚本（服务与手动命令都调它） |
-| `/etc/autosetup/pkgs.snapshot` | 升级前已装包清单 |
+| `/etc/autosetup/pkgs.snapshot` | 升级前已装包清单（全量） |
+| `/etc/autosetup/world.snapshot` | 升级前显式安装的顶层包（还原按它比对，依赖交给 apk） |
+| `/etc/autosetup/release.snapshot` | 升级前的发行版与版本号，用于跨版本判断 |
+| `/etc/autosetup/github-cache/` | GitHub 类包的 apk 离线副本 |
 | `/etc/autosetup/thirdparty.list` | 自动识别出的第三方包 |
 | `/etc/autosetup/repos.snapshot` | 升级前的第三方源行 |
 | `/etc/autosetup/keys/` | 第三方源签名公钥备份 |

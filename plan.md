@@ -129,7 +129,7 @@ DNS 失败时 `configure_dns` 将 DNS 列表（默认网关 + 223.5.5.5、119.29
 
 **持久化前提（关键）**：OpenWrt 的 `sysupgrade` 只保留白名单路径（`/etc/config`、`/etc/sysupgrade.conf`、`/etc/apk/repositories` 等），**自定义目录默认不保留**。因此 `step_snapshot` 每次都会把 `/etc/autosetup` 写进 `/etc/sysupgrade.conf`；否则升级后清单、离线缓存、标记全部丢失，还原层无据可依（实测踩过：清单丢失 → 静默不恢复）。
 
-**钩子说明**：`--init-script` 的脚本会被放进镜像 `/etc/uci-defaults/99-asu-defaults`，内容会上传构建服务器且可从构建哈希公开下载，因此里面**不能有凭据**；它只负责置一个标记。真正的重活由 `/etc/init.d/autosetup` 在开机后等外网可达时执行，失败保留标记、下次开机重试。
+**钩子说明**：`--init-script` 的脚本会被放进镜像 `/etc/uci-defaults/99-asu-defaults`，内容会上传构建服务器且可从构建哈希公开下载，因此里面**不能有凭据**；它只负责置标记并重建服务，不含任何凭据。真正的重活由 `/etc/init.d/autosetup` 在开机后等外网可达时执行，失败保留标记、下次开机重试。
 
 **已知边界**：
 - 跨大版本若触发 `sysupgrade -n`（配置不兼容），静态 IP 会丢，还原层无法联网 → 需先手工恢复网络；
@@ -219,5 +219,6 @@ openwrt-after-upgrade/
 /etc/autosetup/apk-cache/         # 第三方包的 apk 离线备份
 /etc/autosetup/sources.list       # 只能从 GitHub 获取的包的来源登记
 /etc/init.d/autosetup             # procd 服务：有 restore.flag 才执行一次还原
-/etc/owut.d/asu-defaults.sh       # 随镜像下发的 uci-defaults（只置标记，无凭据）
+/etc/autosetup/asu-defaults.sh   # 随镜像下发的 uci-defaults（置标记+重建服务，无凭据）
+/etc/autosetup/init.d-autosetup   # procd 服务副本（/etc/init.d 不在保留清单）
 ```
