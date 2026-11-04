@@ -101,7 +101,11 @@ if [ "$rc" -eq 0 ]; then
     exit 0
 fi
 
-logger -t autosetup "恢复未完全成功，保留标记，下次开机重试"
+if [ -f "$FLAG" ]; then
+    logger -t autosetup "恢复未完全成功，保留标记，下次开机重试"
+else
+    logger -t autosetup "恢复连续失败已达上限，已停止自动重试，详见 $LOG"
+fi
 exit 0
 BOOT
 chmod 755 "$CONF/restore-boot.sh"

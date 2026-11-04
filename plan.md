@@ -115,19 +115,20 @@ DNS 失败时 `configure_dns` 将 DNS 列表（默认网关 + 223.5.5.5、119.29
 **做法**：不写死任何包名，全部按实际清单计算。
 
 1. **识别第三方包** `thirdparty_packages`：
-   - 从 `/etc/apk/repositories`(+`repositories.d/*.list`) 中筛出官方源行（白名单正则 `DISTRO_REPO_RE`，默认匹配 `downloads.openwrt.org` / `mirrors.tuna.tsinghua.edu.cn` 等；第三方 feed 行被排除）；
+   - 从 `/etc/apk/repositories`(+`repositories.d/*.list`) 中筛出官方源行（白名单正则 `DISTRO_REPO_RE`，默认匹配 `downloads.openwrt.org` / `mirrors.tuna.tsinghua.edu.cn` 等域名，以及任意镜像站上 `/openwrt|immortalwrt/releases|snapshots/` 路径；第三方 feed 行被排除）；
    - 以该文件作为 `apk --repositories-file` 覆盖，取官方可用包索引 `apk list -a`；
    - 用一次 `awk` 比对已装清单（`/lib/apk/db/installed` 的 `P:` 行）与官方索引，差集即第三方包，写入 `/etc/autosetup/thirdparty.list`。
 2. **备份** `cache_thirdparty_apks`：对第三方包执行 `apk fetch -o /etc/autosetup/apk-cache`，把 **apk 文件本身**存下来（版本锁定、离线可还原）。下载不到且未登记来源的包会明确告警。
 3. **来源登记** `/etc/autosetup/sources.list`（`owner/repo 包名`）：只用于 GitHub 这类任何 feed 都没有的包；`github_install` 安装成功后自动登记，因此以后新装的包无需人工维护。
 4. **升级编排** `step_upgrade`：先快照/备份（含第三方源行 `repos.snapshot`），再由 `thirdparty.list` 动态生成 `owut upgrade -r <包名...>`（清单来自已装数据库，故用纯包名；旧版 owut 不认 `/if-installed` 后缀），并挂上 `-I`（随镜像下发的 uci-defaults）与 `--progress-size`（显示下载进度）。**不使用 owut 的 `-p/--pre-install`**：该钩子经 `ubus call file exec` 执行且有超时，快照要跑 `apk list`/`apk fetch`，实测直接 `Request timed out`；快照在 upgrade 步骤开头已完成，无需重复。
 5. **首启还原** `step_restore`，由 procd 服务在开机后触发：
-   - 先补回 `/etc/apk/keys` 里第三方源的**签名公钥**（同样不在 sysupgrade 白名单，丢了会报 `UNTRUSTED signature`），再按 `repos.snapshot` 把升级前的第三方源行**原样加回** `/etc/apk/repositories`，然后刷新索引（不依赖任何具体 feed 脚本，与 Nikki 等具体源无关）；
-   - 优先用 `apk add --allow-untrusted /etc/autosetup/apk-cache/*.apk` 离线装回（版本与升级前一致）；
-   - 再用快照差集在线补齐其余缺失；
-   - 最后按 `sources.list` 重装 GitHub 类包。
+   - 先补回 `/etc/apk/keys` 里第三方源的**签名公钥**（同样不在 sysupgrade 白名单，丢了会报 `UNTRUSTED signature`），再按 `repos.snapshot` 把升级前的第三方源行加回 `/etc/apk/repositories`，然后刷新索引；跨分支（如 24.10 → 25.12）时把 URL 中的旧版本号/分支号改写为新的，Nikki 源则重跑其 `feed.sh` 生成；
+   - 同一分支内优先用 `apk-cache/<包名>/`、`github-cache/<包名>/` 离线装回（版本与升级前一致，只装 `thirdparty.list` 中的包）；跨分支时跳过离线缓存，避免装入旧 ABI 的二进制；
+   - 按 `sources.list` 重装 GitHub 类包；
+   - 最后按 `world.snapshot`（顶层包）差集在线补齐，依赖交给 apk 解析；
+   - 以"实际是否装上"判定成败：新版本中已不存在的官方包只告警；第三方包未装回则失败、保留标记重试，连续失败 `MAX_RESTORE_TRIES`（默认 5）次后删除标记，停止自动重试。
 
-**持久化前提（关键）**：OpenWrt 的 `sysupgrade` 只保留白名单路径（`/etc/config`、`/etc/sysupgrade.conf`、`/etc/apk/repositories` 等），**自定义目录默认不保留**。因此 `step_snapshot` 每次都会把 `/etc/autosetup` 写进 `/etc/sysupgrade.conf`；否则升级后清单、离线缓存、标记全部丢失，还原层无据可依（实测踩过：清单丢失 → 静默不恢复）。
+**持久化前提（关键）**：OpenWrt 的 `sysupgrade` 只保留白名单路径（`/etc/config`、`/etc/sysupgrade.conf`、`/etc/apk/repositories` 等），**自定义目录默认不保留**。因此 `step_snapshot` 每次都会把 `/etc/autosetup`、`/etc/init.d/autosetup` 及其开机自启链接 `/etc/rc.d/S95autosetup` 写进 `/etc/sysupgrade.conf`；`upgrade` 在调用 owut 前预置 `restore.flag`（owut 失败则撤销），因此即使 owut 不支持 `-I`，升级后服务仍会自启并执行还原。
 
 **钩子说明**：`--init-script` 的脚本会被放进镜像 `/etc/uci-defaults/99-asu-defaults`，内容会上传构建服务器且可从构建哈希公开下载，因此里面**不能有凭据**；它只负责置标记并重建服务，不含任何凭据。真正的重活由 `/etc/init.d/autosetup` 在开机后等外网可达时执行，失败保留标记、下次开机重试。
 

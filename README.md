@@ -90,18 +90,20 @@ autosetup upgrade
 
 ```mermaid
 flowchart TD
-    A[重启进入新固件] --> B["uci-defaults 置 restore.flag"]
-    B --> C["procd 服务 autosetup 启动"]
+    A[重启进入新固件] --> B["restore.flag 已在升级前预置（uci-defaults 也会再置一次）"]
+    B --> C["procd 服务 autosetup 启动（服务文件与自启链接随 sysupgrade 保留）"]
     C --> D["等外网可达，最长 10 分钟"]
     D --> E["补回 apk 签名公钥"]
-    E --> F["按 repos.snapshot 加回第三方源 → apk update"]
-    F --> G["离线缓存优先装回"]
-    G --> H["按快照差集在线补齐"]
-    H --> I["按 sources.list 装回 GitHub 类包"]
-    I --> J{全部成功?}
+    E --> F["加回第三方源（跨分支时改写版本号 / 重跑 Nikki feed.sh）→ apk update"]
+    F --> G["同分支：离线缓存优先装回；跨分支：跳过"]
+    G --> H["按 sources.list 装回 GitHub 类包"]
+    H --> I["按 world 快照差集在线补齐"]
+    I --> J{第三方包全部装回?}
     J -->|是| K[删除标记，不再重跑]
-    J -->|否| L[保留标记，下次开机重试]
+    J -->|否| L["保留标记，下次开机重试（连续失败 5 次后停止）"]
 ```
+
+新版本里已改名或移除的官方包只告警、不算失败，避免标记永远删不掉。重试上限可用环境变量 `MAX_RESTORE_TRIES` 调整。
 
 日志：
 
@@ -184,15 +186,18 @@ echo '0 4 * * 6 /bin/sh /etc/autosetup/setup.sh upgrade >> /etc/autosetup/cron.l
 | `/etc/autosetup/pkgs.snapshot` | 升级前已装包清单（全量） |
 | `/etc/autosetup/world.snapshot` | 升级前显式安装的顶层包（还原按它比对，依赖交给 apk） |
 | `/etc/autosetup/release.snapshot` | 升级前的发行版与版本号，用于跨版本判断 |
-| `/etc/autosetup/github-cache/` | GitHub 类包的 apk 离线副本 |
+| `/etc/autosetup/github-cache/<包名>/` | GitHub 类包的 apk 离线副本（每包只留一个版本，卸载后自动清理） |
 | `/etc/autosetup/thirdparty.list` | 自动识别出的第三方包 |
 | `/etc/autosetup/repos.snapshot` | 升级前的第三方源行 |
 | `/etc/autosetup/keys/` | 第三方源签名公钥备份 |
-| `/etc/autosetup/apk-cache/` | 第三方包 apk 离线备份（版本锁定） |
+| `/etc/autosetup/apk-cache/<包名>/` | 第三方包 apk 离线备份（版本锁定，每包只留一个版本） |
 | `/etc/autosetup/sources.list` | 只能从 GitHub 获取的包的来源登记 |
+| `/etc/autosetup/restore.flag` | 还原标记：存在才执行还原，成功后删除 |
+| `/etc/autosetup/restore.attempts` | 连续还原失败次数，达到上限（默认 5）后删除标记 |
 | `/etc/autosetup/restore.log` | 每次开机还原的完整日志 |
 | `/etc/autosetup/cron.log` | 启用定时升级时的输出 |
-| `/etc/init.d/autosetup` | procd 服务，有 `restore.flag` 才执行一次 |
+| `/etc/init.d/autosetup` | procd 服务，有 `restore.flag` 才执行一次（已登记进 sysupgrade.conf） |
+| `/etc/rc.d/S95autosetup` | 服务开机自启链接（已登记进 sysupgrade.conf，`-I` 失效时仍能自启） |
 | `/etc/autosetup/asu-defaults.sh` | 随镜像下发的 uci-defaults，仅置标记（放在保留目录内） |
 | `/etc/autosetup/init.d-autosetup` | procd 服务文件副本，升级后据此重建 `/etc/init.d/autosetup` |
 
@@ -219,6 +224,8 @@ autosetup restore
 # 更新脚本本身
 wget -O /etc/autosetup/setup.sh https://raw.githubusercontent.com/rocdeng/openwrt-autosetup/main/setup.sh
 ln -sf /etc/autosetup/setup.sh /usr/bin/autosetup
+# 更新后先重新快照一次再升级（生成 world/release 快照与按包分目录的离线缓存）
+sh /etc/autosetup/setup.sh snapshot
 
 # 指定上级网关 / DNS
 sh /etc/autosetup/setup.sh netcheck --gateway 192.168.1.1 --dns 223.5.5.5

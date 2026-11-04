@@ -21,6 +21,10 @@ WORLD_SNAPSHOT="$CONF_DIR/world.snapshot"
 RELEASE_MARK="$CONF_DIR/release.snapshot"
 GH_CACHE="$CONF_DIR/github-cache"
 SOURCES_FILE="$CONF_DIR/sources.list"
+RESTORE_FLAG="$CONF_DIR/restore.flag"
+# 连续还原失败计数：达到上限后删除标记，避免每次开机/网络变化无限重跑
+ATTEMPTS_FILE="$CONF_DIR/restore.attempts"
+MAX_RESTORE_TRIES="${MAX_RESTORE_TRIES:-5}"
 # init-script 与服务工作副本都放在 /etc/autosetup 下：只有这个目录被登记进
 # /etc/sysupgrade.conf，升级后仍然存在
 OWUT_INIT="$CONF_DIR/asu-defaults.sh"
@@ -310,9 +314,13 @@ install_apk_url() {
         return 1
     fi
     info "安装成功: ${url##*/}"
-    # 另存一份到保留目录：GitHub 类包不在任何 feed，离线时只能靠这份副本
-    mkdir -p "$GH_CACHE" 2>/dev/null
-    cp -f "$out" "$GH_CACHE/${url##*/}" 2>/dev/null
+    # 另存一份到保留目录：GitHub 类包不在任何 feed，离线时只能靠这份副本。
+    # 按包名分目录且每次替换整个目录，保证每个包只留一个版本（多版本并存会导致降级）
+    if [ -n "$name" ]; then
+        rm -rf "$GH_CACHE/$name"
+        mkdir -p "$GH_CACHE/$name" 2>/dev/null \
+            && cp -f "$out" "$GH_CACHE/$name/" 2>/dev/null
+    fi
 }
 
 github_install() {
@@ -767,7 +775,9 @@ step_cert() {
 # ---- 值守式升级还原层 ----
 # 第三方包 = 已安装、但不在发行版官方软件源里的包（第三方 feed 或从 GitHub 安装）。
 # 全程不写死包名：识别、备份、剔除、还原都按实际清单计算。
-DISTRO_REPO_RE="${DISTRO_REPO_RE:-downloads\.openwrt\.org|downloads\.immortalwrt\.org|mirrors\.tuna\.tsinghua\.edu\.cn|mirrors\.immortalwrt\.org}"
+# 除已知域名外，再按路径特征识别任意镜像站（ustc/aliyun/sjtu 等）的官方源：
+# 其路径形如 https://<镜像>/openwrt/releases/...，第三方 feed 极少使用这种路径
+DISTRO_REPO_RE="${DISTRO_REPO_RE:-downloads\.openwrt\.org|downloads\.immortalwrt\.org|mirrors\.tuna\.tsinghua\.edu\.cn|mirrors\.immortalwrt\.org|/(openwrt|immortalwrt)/(releases|snapshots)/}"
 
 # 已装包名：优先读 apk 数据库（不受输出格式变化影响），回退 apk info
 list_installed() {
@@ -837,7 +847,13 @@ ensure_keep_entry() {
     conf=/etc/sysupgrade.conf
     mkdir -p "$CONF_DIR" 2>/dev/null
     added=""
-    for p in "$CONF_DIR" /etc/init.d/autosetup; do
+    # 服务的开机自启链接同样不在白名单：只保留 init.d 文件而没有 rc.d 链接，
+    # owut 不支持 -I 时服务开机不会启动，还原就静默失效
+    if [ -f /etc/init.d/autosetup ] && ! /etc/init.d/autosetup enabled 2>/dev/null; then
+        /etc/init.d/autosetup enable 2>/dev/null
+    fi
+    rc_link=$(ls /etc/rc.d/S*autosetup 2>/dev/null | head -n 1)
+    for p in "$CONF_DIR" /etc/init.d/autosetup $rc_link; do
         grep -qs "^$p/*\$" "$conf" 2>/dev/null && continue
         printf '%s\n' "$p" >> "$conf" 2>/dev/null && added="$added $p"
     done
@@ -877,50 +893,110 @@ snapshot_extra_repos() {
     info "已记录 $(wc -l < "$REPOS_SNAPSHOT" | tr -d ' ') 个第三方源 -> $REPOS_SNAPSHOT"
 }
 
+# 版本号 -> 分支号：24.10.2 -> 24.10，25.12.0-rc1 -> 25.12，SNAPSHOT 保持不变
+release_branch() {
+    case "$1" in
+        *SNAPSHOT*|*snapshot*) printf 'SNAPSHOT'; return 0 ;;
+    esac
+    b=$(printf '%s' "$1" | sed -n 's/^\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
+    printf '%s' "${b:-$1}"
+}
+
+# 读取升级前的发行版信息，判断是否跨分支（小版本升级不算）
+# 结果写入全局变量 OLD_ID OLD_REL OLD_BRANCH NEW_BRANCH BRANCH_CHANGED
+detect_release_change() {
+    OLD_ID=""; OLD_REL=""; OLD_BRANCH=""; BRANCH_CHANGED=0
+    NEW_BRANCH=$(release_branch "${DISTRIB_RELEASE:-}")
+    [ -f "$RELEASE_MARK" ] || return 0
+    read -r OLD_ID OLD_REL < "$RELEASE_MARK" 2>/dev/null
+    OLD_BRANCH=$(release_branch "$OLD_REL")
+    if [ "$OLD_ID" != "$DISTRIB_ID" ] || [ "$OLD_BRANCH" != "$NEW_BRANCH" ]; then
+        BRANCH_CHANGED=1
+    fi
+}
+
+# 把字符串转成可安全放进 sed 正则的形式（只需处理版本号里会出现的字符）
+sed_escape() {
+    printf '%s' "$1" | sed 's/[.[\*^$#]/\\&/g'
+}
+
 # 把快照里的第三方源加回当前配置
 restore_extra_repos() {
     [ -f "$REPOS_SNAPSHOT" ] || return 0
     target=/etc/apk/repositories
-    old_rel=$(cut -d' ' -f2 "$RELEASE_MARK" 2>/dev/null)
-    new_rel="${DISTRIB_RELEASE:-}"
+    need_nikki=0
     while read -r u; do
         [ -n "$u" ] || continue
-        # 跨版本时把旧版本号改写成当前版本，避免回放旧分支的源
-        if [ -n "$old_rel" ] && [ -n "$new_rel" ] && [ "$old_rel" != "$new_rel" ]; then
-            nv=$(printf '%s' "$u" | sed "s#$old_rel#$new_rel#g")
-            [ "$nv" != "$u" ] && info "源地址已按新版本改写: $u -> $nv"
+        if [ "$BRANCH_CHANGED" = 1 ]; then
+            # Nikki 的源地址由 feed.sh 按当前分支/架构生成，跨分支时重跑它最可靠
+            case "$u" in
+                *nikki*) need_nikki=1; continue ;;
+            esac
+            # 其余源：先替换完整版本号，再替换分支号（两侧要求非数字，避免误伤别的数字）
+            nv="$u"
+            if [ -n "$OLD_REL" ] && [ -n "$DISTRIB_RELEASE" ]; then
+                nv=$(printf '%s' "$nv" | sed "s#$(sed_escape "$OLD_REL")#$DISTRIB_RELEASE#g")
+            fi
+            if [ -n "$OLD_BRANCH" ] && [ -n "$NEW_BRANCH" ] && [ "$OLD_BRANCH" != "SNAPSHOT" ]; then
+                ob=$(sed_escape "$OLD_BRANCH")
+                nv=$(printf '%s' "$nv" | sed \
+                    -e "s#\([^0-9.]\)$ob\([^0-9.]\)#\1$NEW_BRANCH\2#g" \
+                    -e "s#\([^0-9.]\)$ob\$#\1$NEW_BRANCH#")
+            fi
+            if [ "$nv" != "$u" ]; then
+                info "源地址已按新版本改写: $u -> $nv"
+            else
+                warn "跨版本但源地址中未找到旧版本号，原样加回（可能仍指向旧分支）: $u"
+            fi
             u="$nv"
         fi
         grep -qsxF "$u" "$target" 2>/dev/null && continue
         printf '%s\n' "$u" >> "$target" && info "已恢复第三方源: $u"
     done < "$REPOS_SNAPSHOT"
+
+    if [ "$need_nikki" = 1 ]; then
+        info "跨版本升级：重新执行 Nikki feed.sh 生成新分支的源"
+        ensure_nikki_feed || warn "Nikki 源重建失败，Nikki 相关包可能无法装回"
+    fi
 }
 
 # 升级前把第三方包本身的 apk 文件缓存下来（版本锁定、离线可还原）
+# 目录结构：apk-cache/<包名>/<文件>.apk，每个包只保留一个版本
 cache_thirdparty_apks() {
     [ -s "$THIRD_LIST" ] || return 0
     staging="$APK_CACHE.new"
     rm -rf "$staging"
     mkdir -p "$staging" || return 1
-    # 先把旧缓存搬进 staging：本次下载失败的包仍保留上次的副本
-    [ -d "$APK_CACHE" ] && cp -f "$APK_CACHE"/*.apk "$staging"/ 2>/dev/null
     # 逐包 fetch：批量时只要有一个包不可用，整条命令就会失败、一个都下不到
     failed=""
+    kept=""
     for p in $(cat "$THIRD_LIST"); do
-        if ! apk fetch -o "$staging" "$p" >/dev/null 2>&1; then
+        mkdir -p "$staging/$p"
+        if apk fetch -o "$staging/$p" "$p" >/dev/null 2>&1 \
+                && ls "$staging/$p"/*.apk >/dev/null 2>&1; then
+            continue
+        fi
+        rm -rf "$staging/$p"
+        # 本次取不到：沿用上次该包的副本（只此一份，不会和新版本并存）
+        if ls "$APK_CACHE/$p"/*.apk >/dev/null 2>&1; then
+            cp -a "$APK_CACHE/$p" "$staging/$p" && kept="$kept $p"
+        else
             failed="$failed $p"
         fi
     done
-    got=$(ls "$staging"/*.apk 2>/dev/null | wc -l | tr -d ' ')
-    [ -n "$failed" ] && log "以下包源里取不到（无法离线备份）:$failed"
+    # 不在本次清单里的包（已卸载或已变成官方包）不再带入新缓存，升级后也就不会被装回
     rm -rf "$APK_CACHE"
     mv "$staging" "$APK_CACHE"
+    got=$(ls "$APK_CACHE"/*/*.apk 2>/dev/null | wc -l | tr -d ' ')
+    [ -n "$kept" ] && warn "以下包本次下载失败，沿用上次的离线副本:$kept"
+    [ -n "$failed" ] && log "以下包源里取不到（无法离线备份）:$failed"
     info "已离线备份 $got 个第三方包 -> $APK_CACHE"
 
     # 既下载不到、也没登记来源的包，升级后无法自动装回：如实列出
     unknown=""
     for p in $(cat "$THIRD_LIST"); do
-        ls "$APK_CACHE/$p"-*.apk >/dev/null 2>&1 && continue
+        ls "$APK_CACHE/$p"/*.apk >/dev/null 2>&1 && continue
+        ls "$GH_CACHE/$p"/*.apk >/dev/null 2>&1 && continue
         grep -qs " $p\$" "$SOURCES_FILE" && continue
         unknown="$unknown $p"
     done
@@ -928,6 +1004,17 @@ cache_thirdparty_apks() {
         warn "以下第三方包来源未知，升级后无法自动装回:$unknown"
         info "登记方式（一次即可）: echo 'owner/repo 包名' >> $SOURCES_FILE"
     fi
+}
+
+# GitHub 包副本：清掉旧版平铺文件，以及已卸载包的副本
+prune_github_cache() {
+    [ -d "$GH_CACHE" ] || return 0
+    rm -f "$GH_CACHE"/*.apk 2>/dev/null
+    for d in "$GH_CACHE"/*/; do
+        [ -d "$d" ] || continue
+        n=$(basename "$d")
+        is_installed "$n" || { rm -rf "$GH_CACHE/$n"; info "已删除已卸载包的离线副本: $n"; }
+    done
 }
 
 step_snapshot() {
@@ -972,12 +1059,13 @@ step_snapshot() {
     fi
     snapshot_extra_repos
     snapshot_apk_keys
+    prune_github_cache
 
     # world = 显式安装的顶层包。还原只补这些，依赖交给 apk 解析，
     # 否则会把旧依赖（可能已改名/被替代）也写进 world，越滚越脏
     if [ -r /etc/apk/world ]; then
         grep -Ev '^[[:space:]]*(#|$)' /etc/apk/world 2>/dev/null \
-            | sed 's/[<>=~].*$//' | sort -u > "$WORLD_SNAPSHOT"
+            | sed 's/[<>=~@].*$//' | sort -u > "$WORLD_SNAPSHOT"
         info "已记录 $(wc -l < "$WORLD_SNAPSHOT" | tr -d ' ') 个顶层包 -> $WORLD_SNAPSHOT"
     else
         : > "$WORLD_SNAPSHOT"
@@ -1002,48 +1090,79 @@ restore_sources() {
 }
 
 # 优先用升级前的 apk 缓存离线还原（版本与升级前一致）
+# 只装升级前清单里的第三方包：用户卸载过的包即使还有副本也不会被装回
 restore_offline_cache() {
-    for dir in "$GH_CACHE" "$APK_CACHE"; do
-        [ -d "$dir" ] || continue
-        set -- "$dir"/*.apk
-        [ -f "$1" ] || continue
-        log "从离线缓存安装 $# 个 apk（$dir）"
-        if apk add --allow-untrusted "$@" >/dev/null 2>"$TMP_DIR/apk.err"; then
-            continue
-        fi
-        for f in "$@"; do
-            apk add --allow-untrusted "$f" >/dev/null 2>"$TMP_DIR/apk.err" \
-                || warn "离线安装失败 ${f##*/}: $(head -n 2 "$TMP_DIR/apk.err" 2>/dev/null | tr '\n' ' ')"
+    [ -s "$THIRD_LIST" ] || return 0
+    files=""
+    for p in $(cat "$THIRD_LIST"); do
+        is_installed "$p" && continue
+        for d in "$APK_CACHE/$p" "$GH_CACHE/$p"; do
+            set -- "$d"/*.apk
+            [ -f "$1" ] || continue
+            files="$files $*"
+            break
         done
     done
+    [ -n "$files" ] || return 0
+    set -- $files
+    log "从离线缓存安装 $# 个 apk（版本与升级前一致）"
+    if apk add --allow-untrusted "$@" >/dev/null 2>"$TMP_DIR/apk.err"; then
+        return 0
+    fi
+    for f in "$@"; do
+        apk add --allow-untrusted "$f" >/dev/null 2>"$TMP_DIR/apk.err" \
+            || warn "离线安装失败 ${f##*/}: $(head -n 2 "$TMP_DIR/apk.err" 2>/dev/null | tr '\n' ' ')"
+    done
     return 0
+}
+
+# 包是否还存在于当前已启用的任一软件源索引中
+pkg_available() {
+    apk list -a "$1" 2>/dev/null | awk -v n="$1" '
+        index($0, n "-") == 1 && substr($0, length(n) + 2) ~ /^[0-9]/ { f = 1 }
+        END { exit !f }'
+}
+
+# 记录一次还原失败；连续失败达到上限就删除标记，停止开机自动重试
+restore_attempt_failed() {
+    n=$(cat "$ATTEMPTS_FILE" 2>/dev/null)
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    n=$((n + 1))
+    printf '%s\n' "$n" > "$ATTEMPTS_FILE" 2>/dev/null
+    if [ "$n" -ge "$MAX_RESTORE_TRIES" ]; then
+        if [ -f "$RESTORE_FLAG" ]; then
+            rm -f "$RESTORE_FLAG"
+            err "还原已连续失败 $n 次，停止自动重试；排查后手动执行: sh $0 restore"
+        fi
+    else
+        warn "还原失败（第 $n/$MAX_RESTORE_TRIES 次），保留标记，下次开机自动重试"
+    fi
 }
 
 step_restore() {
     section "恢复升级前的软件与网络"
     if ! ensure_network; then
         err "网络未就绪，无法恢复；恢复网络后重跑: sh $0 restore"
+        restore_attempt_failed
         record_fail "restore"
         return 1
     fi
 
-    # 版本是否变化：跨分支时离线缓存与旧源都不可靠
-    ver_changed=0
-    if [ -f "$RELEASE_MARK" ]; then
-        old_rel=$(cat "$RELEASE_MARK" 2>/dev/null)
-        cur_rel="${DISTRIB_ID:-unknown} ${DISTRIB_RELEASE:-unknown}"
-        [ "$old_rel" != "$cur_rel" ] && ver_changed=1
-        [ "$ver_changed" = 1 ] && warn "系统版本已变化（$old_rel -> $cur_rel）"
+    # 跨分支（如 24.10 -> 25.12）时离线缓存与旧源都不可靠；小版本升级不算
+    detect_release_change
+    if [ "$BRANCH_CHANGED" = 1 ]; then
+        warn "系统分支已变化（$OLD_ID $OLD_REL -> $DISTRIB_ID $DISTRIB_RELEASE）"
     fi
 
     # 1) 补回公钥 → 加回源 → 刷索引
     restore_apk_keys
     restore_extra_repos
-    apk_update_force || warn "软件索引刷新失败，仍继续尝试恢复"
+    idx_ok=1
+    apk_update_force || { idx_ok=0; warn "软件索引刷新失败，仍继续尝试恢复"; }
 
-    # 2) 离线缓存（仅在同一版本内使用，避免装入旧 ABI 的二进制）
-    if [ "$ver_changed" = 1 ]; then
-        warn "跨版本升级，跳过离线缓存，改用在线安装"
+    # 2) 离线缓存（仅在同一分支内使用，避免装入旧 ABI 的二进制）
+    if [ "$BRANCH_CHANGED" = 1 ]; then
+        warn "跨分支升级，跳过离线缓存，改用在线安装"
     else
         restore_offline_cache
     fi
@@ -1058,6 +1177,7 @@ step_restore() {
     if [ ! -f "$want" ]; then
         err "未找到清单（$want），无法判断要装回哪些包"
         info "检查 /etc/sysupgrade.conf 是否包含 /etc/autosetup，或重跑 restore-install.sh"
+        restore_attempt_failed
         record_fail "restore"
         return 1
     fi
@@ -1080,14 +1200,31 @@ step_restore() {
         fi
     fi
 
-    # 5) 最终以“实际装上了没有”判定成败，而不是中间步骤的报错
+    # 5) 最终以“实际装上了没有”判定成败，而不是中间步骤的报错。
+    #    官方包在新版本里已被改名/移除（索引正常却查不到）属于永久性缺失，重试也没用，
+    #    只告警不计失败；第三方包、GitHub 包或索引刷新失败时一律算失败，留给下次重试
     list_installed | sort -u > "$TMP_DIR/cur.txt"
-    still=$(grep -vxF -f "$TMP_DIR/cur.txt" "$want" 2>/dev/null | tr '\n' ' ')
-    if [ -n "$still" ]; then
-        warn "以下包仍未恢复，可能源里已不存在:$still"
+    still=$(grep -vxF -f "$TMP_DIR/cur.txt" "$want" 2>/dev/null)
+    hard=""
+    gone=""
+    for p in $still; do
+        if [ "$idx_ok" = 1 ] \
+                && ! grep -qsxF "$p" "$THIRD_LIST" \
+                && ! grep -qs " $p\$" "$SOURCES_FILE" \
+                && ! pkg_available "$p"; then
+            gone="$gone $p"
+        else
+            hard="$hard $p"
+        fi
+    done
+    [ -n "$gone" ] && warn "以下官方包在新版本源中已不存在，跳过（不再重试）:$gone"
+    if [ -n "$hard" ]; then
+        warn "以下包仍未恢复:$hard"
+        restore_attempt_failed
         record_fail "restore"
         return 1
     fi
+    rm -f "$ATTEMPTS_FILE"
     info "恢复完成：本次补装 $restored 个包"
 }
 
@@ -1102,6 +1239,7 @@ ensure_restore_files() {
 # （内容会上传构建服务器，并可从构建哈希公开下载）
 mkdir -p /etc/autosetup
 touch /etc/autosetup/restore.flag
+rm -f /etc/autosetup/restore.attempts
 # 服务文件本身不在 sysupgrade 白名单，从 /etc/autosetup 的副本重建
 if [ -f /etc/autosetup/init.d-autosetup ]; then
     mkdir -p /etc/init.d
@@ -1145,6 +1283,9 @@ exit 0' > "$OWUT_INIT" 2>/dev/null; then
                 && info "已把 owut init_script 规范为 $OWUT_INIT"
         fi
     fi
+
+    # 服务文件可能刚被重建并 enable，再登记一次保留清单（含 rc.d 自启链接）
+    ensure_keep_entry
 }
 
 step_upgrade() {
@@ -1161,9 +1302,11 @@ step_upgrade() {
     step_snapshot || { err "快照失败，已中止升级"; record_fail "upgrade"; return 1; }
     ensure_restore_files
 
-    # 兜底：标记放在保留目录里，即使 owut 不支持 -I 也能在升级后触发还原；
-    # 若本次升级最终没刷机，下次开机会跑一次 restore 并以“无需恢复”结束，无副作用
-    : > "$CONF_DIR/restore.flag" 2>/dev/null && info "已预置还原标记 restore.flag"
+    # 兜底：标记放在保留目录里，即使 owut 不支持 -I 也能在升级后触发还原
+    # （服务文件与 rc.d 自启链接已登记进 sysupgrade.conf）。
+    # 新一轮升级，失败计数清零；owut 失败（未刷机）时删除标记，避免日常运行中被误触发
+    rm -f "$ATTEMPTS_FILE"
+    : > "$RESTORE_FLAG" 2>/dev/null && info "已预置还原标记 restore.flag"
 
     remove_list=""
     if [ -s "$THIRD_LIST" ]; then
@@ -1193,7 +1336,12 @@ step_upgrade() {
     esac
 
     log "执行: owut $*"
-    owut "$@" || { err "owut 升级失败"; record_fail "upgrade"; return 1; }
+    owut "$@" || {
+        rm -f "$RESTORE_FLAG"
+        err "owut 升级失败（未刷机，已撤销还原标记）"
+        record_fail "upgrade"
+        return 1
+    }
 }
 
 if [ -n "$GITHUB_PROXY" ]; then
