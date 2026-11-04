@@ -911,9 +911,11 @@ snapshot_extra_repos() {
         grep -Ev '^[[:space:]]*(#|$)' "$f" 2>/dev/null \
             | grep -Ev "$DISTRO_REPO_RE" >> "$REPOS_SNAPSHOT"
     done
-    # 选项必须写在文件名之前：BusyBox sort 遇到第一个非选项参数就停止解析，
-    # 写成 `sort -u FILE -o FILE` 会把内容打印到终端且不去重
-    sort -u -o "$REPOS_SNAPSHOT" "$REPOS_SNAPSHOT" 2>/dev/null
+    # 不用 sort -o：OpenWrt 的 BusyBox 未启用 FEATURE_SORT_BIG，会接受 -o 但直接忽略，
+    # 结果仍输出到终端、文件也不去重（真机实测）。改用临时文件
+    sort -u "$REPOS_SNAPSHOT" > "$REPOS_SNAPSHOT.tmp" 2>/dev/null \
+        && mv -f "$REPOS_SNAPSHOT.tmp" "$REPOS_SNAPSHOT"
+    rm -f "$REPOS_SNAPSHOT.tmp"
     [ -s "$REPOS_SNAPSHOT" ] || return 0
     info "已记录 $(wc -l < "$REPOS_SNAPSHOT" | tr -d ' ') 个第三方源 -> $REPOS_SNAPSHOT"
 }
@@ -1031,6 +1033,8 @@ cache_thirdparty_apks() {
     # 逐包 fetch：批量时只要有一个包不可用，整条命令就会失败、一个都下不到
     failed=""
     kept=""
+    gh_only=""
+    nocopy=""
     for p in $(cat "$THIRD_LIST"); do
         mkdir -p "$staging/$p"
         if apk fetch -o "$staging/$p" "$p" >/dev/null 2>"$TMP_DIR/fetch.err" \
@@ -1045,7 +1049,12 @@ cache_thirdparty_apks() {
         if ls "$APK_CACHE/$p"/*.apk >/dev/null 2>&1; then
             cp -a "$APK_CACHE/$p" "$staging/$p" && kept="$kept $p"
         else
-            failed="$failed $p"
+            # GitHub 类包本来就不在任何 feed 里，单独归类，避免误以为备份出了问题
+            if grep -qs " $p\$" "$SOURCES_FILE"; then
+                gh_only="$gh_only $p"
+            else
+                failed="$failed $p"
+            fi
         fi
     done
     # 不在本次清单里的包（已卸载或已变成官方包）不再带入新缓存，升级后也就不会被装回
@@ -1054,6 +1063,14 @@ cache_thirdparty_apks() {
     got=$(ls "$APK_CACHE"/*/*.apk 2>/dev/null | wc -l | tr -d ' ')
     [ -n "$kept" ] && warn "以下包本次下载失败，沿用上次的离线副本:$kept"
     [ -n "$failed" ] && log "以下包源里取不到（无法离线备份）:$failed"
+    if [ -n "$gh_only" ]; then
+        log "以下为 GitHub 类包，升级后按 sources.list 从 GitHub 重装:$gh_only"
+        for p in $gh_only; do
+            ls "$GH_CACHE/$p"/*.apk >/dev/null 2>&1 && continue
+            nocopy="$nocopy $p"
+        done
+        [ -n "$nocopy" ] && info "其中尚无离线副本（GitHub 不可达时无法装回）:$nocopy；需要副本可执行 FORCE=1 sh $0 openclash argon 重装一次"
+    fi
     info "已离线备份 $got 个第三方包 -> $APK_CACHE"
 
     # 既下载不到、也没登记来源的包，升级后无法自动装回：如实列出

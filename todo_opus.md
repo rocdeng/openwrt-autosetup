@@ -140,3 +140,10 @@
 - [x] **Nikki 源已补回**：`feed.sh` 已写入源和 `nikki.pem`，nikki 的索引也取到了。
 - [x] **只要有一个源不可用，`apk update` 就判为整体失败**：daeuniverse 的 kmods 源 `.../25.12/kmods/25.12.0/...` 返回 404（该站现在只有 `kmods/25.12.6/`），于是 `apk update` 返回非零，nikki 步骤被误判为失败。现在只要还有可用的包索引，就按"部分成功"处理：列出不可用的源后继续执行。restore 遇到部分成功时，不会把"源里查不到"判定为包已永久消失。
 - [ ] 设备侧：daeuniverse 的源目前没有对应的已装包（`thirdparty.list` 里没有 dae 相关的包）。如果不用 dae，建议从 `customfeeds.list` 删掉这两行；如果要用，升级到 25.12.6 后 kmods 地址会被自动改写为 `kmods/25.12.6/`。
+
+## 九、第五轮：Nikki 补源后的 snapshot
+
+- [x] Nikki 的 3 个包已离线备份，签名公钥变为 3 个。
+- [x] **源行仍被打印到终端**：上一轮的 `sort -u -o F F` 修复无效。OpenWrt 的 BusyBox 没有启用 `FEATURE_SORT_BIG`，它接受 `-o` 参数但会直接忽略，结果仍然输出到 stdout，文件也不去重。现在改为先写临时文件，再 `mv` 覆盖。
+- [x] **GitHub 类包被列在"源里取不到"里**，看起来像备份出了问题。现在单独归为一类，并提示其中哪些还没有离线副本。
+- [ ] 设备侧：`chinadns-ng`、`dns2socks`、`shadowsocksr-libev-ssr-local`、`tcping` 仍然来源未知，`upgrade` 会被拦截。
