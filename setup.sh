@@ -171,14 +171,35 @@ is_installed() {
 }
 
 APK_UPDATED=0
+# 1 = 最近一次 apk update 只部分成功（有源不可用，其余源索引已更新）
+APK_PARTIAL=0
 
 apk_update() {
     [ "$APK_UPDATED" = 1 ] && return 0
     apk_update_force
 }
 
+# apk update 只要有一个源取不到（如第三方源下架了旧版本目录）就返回非零，
+# 但其余源的索引其实已经更新好了。这种“部分成功”不应让整个步骤失败：
+# 返回 0 并置 APK_PARTIAL=1，需要严格判断的调用方（如 restore）自行检查
 apk_update_force() {
-    apk update && APK_UPDATED=1
+    APK_PARTIAL=0
+    out=$(apk update 2>&1)
+    rc=$?
+    printf '%s\n' "$out" | tee -a "$LOG_FILE"
+    if [ "$rc" -eq 0 ]; then
+        APK_UPDATED=1
+        return 0
+    fi
+    avail=$(printf '%s\n' "$out" | sed -n 's/.* \([0-9][0-9]*\) distinct packages available.*/\1/p' | tail -n 1)
+    if [ -n "$avail" ] && [ "$avail" -gt 0 ]; then
+        APK_PARTIAL=1
+        APK_UPDATED=1
+        bad=$(printf '%s\n' "$out" | sed -n 's/^WARNING: updating and opening \(.*\): [^:]*$/\1/p' | sort -u | tr '\n' ' ')
+        warn "部分软件源不可用，其余源索引已更新，继续执行。不可用的源: ${bad:-见上方 WARNING}"
+        return 0
+    fi
+    return 1
 }
 
 # 下载工具：优先 curl，否则 wget；wget 兼容 BusyBox（不支持 --tries）
@@ -1212,6 +1233,8 @@ step_restore() {
     restore_extra_repos
     idx_ok=1
     apk_update_force || { idx_ok=0; warn "软件索引刷新失败，仍继续尝试恢复"; }
+    # 部分源不可用时，“源里查不到”可能只是那个源没取到，不能据此判定包已永久消失
+    [ "$APK_PARTIAL" = 1 ] && idx_ok=0
 
     # 2) 离线缓存（仅在同一分支内使用，避免装入旧 ABI 的二进制）
     if [ "$BRANCH_CHANGED" = 1 ]; then

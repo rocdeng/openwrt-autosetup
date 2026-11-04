@@ -134,3 +134,9 @@
 
 - [ ] `nikki`、`luci-app-nikki`、`luci-i18n-nikki-zh-cn` 已经装着，但当前源里没有 Nikki 源（`repos.snapshot` 只有 daeuniverse 两行），所以既拿不到离线副本，也没法在线装回。需要重新执行 `autosetup nikki` 补回 Nikki 源。
 - [ ] `chinadns-ng`、`dns2socks`、`shadowsocksr-libev-ssr-local`、`tcping` 的所属源不在当前配置里。要么补回对应的源，要么在不需要时卸载。
+
+## 八、第四轮：`autosetup nikki` 真机输出
+
+- [x] **Nikki 源已补回**：`feed.sh` 已写入源和 `nikki.pem`，nikki 的索引也取到了。
+- [x] **只要有一个源不可用，`apk update` 就判为整体失败**：daeuniverse 的 kmods 源 `.../25.12/kmods/25.12.0/...` 返回 404（该站现在只有 `kmods/25.12.6/`），于是 `apk update` 返回非零，nikki 步骤被误判为失败。现在只要还有可用的包索引，就按"部分成功"处理：列出不可用的源后继续执行。restore 遇到部分成功时，不会把"源里查不到"判定为包已永久消失。
+- [ ] 设备侧：daeuniverse 的源目前没有对应的已装包（`thirdparty.list` 里没有 dae 相关的包）。如果不用 dae，建议从 `customfeeds.list` 删掉这两行；如果要用，升级到 25.12.6 后 kmods 地址会被自动改写为 `kmods/25.12.6/`。
