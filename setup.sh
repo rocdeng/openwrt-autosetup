@@ -184,6 +184,7 @@ apk_update() {
 # 返回 0 并置 APK_PARTIAL=1，需要严格判断的调用方（如 restore）自行检查
 apk_update_force() {
     APK_PARTIAL=0
+    APK_BAD=""
     out=$(apk update 2>&1)
     rc=$?
     printf '%s\n' "$out" | tee -a "$LOG_FILE"
@@ -198,6 +199,7 @@ apk_update_force() {
         bad=$(printf '%s\n' "$out" | sed -n \
             -e 's/^WARNING: updating and opening \(.*\): [^:]*$/\1/p' \
             -e 's/^WARNING: updating \(.*\): [^:]*$/\1/p' | sort -u | tr '\n' ' ')
+        APK_BAD="$bad"
         warn "部分软件源不可用，其余源索引已更新，继续执行。不可用的源: ${bad:-见上方 WARNING}"
         return 0
     fi
@@ -686,6 +688,32 @@ ensure_nikki_feed() {
     NIKKI_FEED_OK=1
 }
 
+# 把所有 apk 源文件里的官方地址改写为清华镜像（只改写，不刷新索引）
+# mirror 步骤与升级后的 restore 共用：升级会把 distfeeds.list 重置回 downloads.openwrt.org
+apply_mirror_files() {
+    targets="/etc/apk/repositories"
+    [ -d /etc/apk/repositories.d ] && targets="$targets $(ls /etc/apk/repositories.d/*.list 2>/dev/null)"
+    for f in $targets; do
+        sanitize_repo_file "$f"
+    done
+}
+
+# apply_mirror_files 的逆操作：只把清华镜像地址换回官方域名，其余行（如第三方源）不动
+revert_mirror_files() {
+    targets="/etc/apk/repositories"
+    [ -d /etc/apk/repositories.d ] && targets="$targets $(ls /etc/apk/repositories.d/*.list 2>/dev/null)"
+    if [ "$FLAVOR" = "immortal" ]; then
+        from='//mirrors\.tuna\.tsinghua\.edu\.cn/immortalwrt'; to='//downloads.immortalwrt.org'
+    else
+        from='//mirrors\.tuna\.tsinghua\.edu\.cn/openwrt'; to='//downloads.openwrt.org'
+    fi
+    for f in $targets; do
+        [ -f "$f" ] && grep -q 'mirrors\.tuna\.tsinghua\.edu\.cn' "$f" || continue
+        sed "s#$from#$to#g" "$f" > "$f.tmp.$$" && cat "$f.tmp.$$" > "$f"
+        rm -f "$f.tmp.$$"
+    done
+}
+
 step_mirror() {
     section "步骤 1/5 替换软件源为清华源"
 
@@ -701,11 +729,7 @@ step_mirror() {
         info "检测到 OpenWrt 官方版"
     fi
 
-    targets="/etc/apk/repositories"
-    [ -d /etc/apk/repositories.d ] && targets="$targets $(ls /etc/apk/repositories.d/*.list 2>/dev/null)"
-    for f in $targets; do
-        sanitize_repo_file "$f"
-    done
+    apply_mirror_files
 
     # 清华源改完后立刻接入 Nikki 源，随后只更新一次索引即可覆盖两者
     if ensure_nikki_feed; then
@@ -1267,11 +1291,33 @@ step_restore() {
         warn "系统分支已变化（$OLD_ID $OLD_REL -> $DISTRIB_ID $DISTRIB_RELEASE）"
     fi
 
+    # 0) 升级会把官方源重置回 downloads.openwrt.org，先换回清华镜像再装包
+    #    （MIRROR_ON_RESTORE=0 可关闭）
+    mirrored=0
+    if [ "${MIRROR_ON_RESTORE:-1}" = "1" ]; then
+        info "切换官方源为清华镜像"
+        apply_mirror_files
+        mirrored=1
+    fi
+
     # 1) 补回公钥 → 加回源 → 刷索引
     restore_apk_keys
     restore_extra_repos
     idx_ok=1
-    apk_update_force || { idx_ok=0; warn "软件索引刷新失败，仍继续尝试恢复"; }
+    apk_update_force || idx_ok=0
+    # 刚发布的版本镜像可能还没同步：清华源取不到就退回官方源，不让还原卡在这里
+    if [ "$mirrored" = 1 ]; then
+        case "$idx_ok $APK_BAD" in
+            0*|*mirrors.tuna.tsinghua.edu.cn*)
+                warn "清华镜像暂不可用（可能尚未同步新版本），本次退回官方源"
+                revert_mirror_files
+                idx_ok=1
+                apk_update_force || idx_ok=0
+                info "镜像同步后可执行 sh $0 mirror 再切换"
+                ;;
+        esac
+    fi
+    [ "$idx_ok" = 1 ] || warn "软件索引刷新失败，仍继续尝试恢复"
     # 部分源不可用时，“源里查不到”可能只是那个源没取到，不能据此判定包已永久消失
     [ "$APK_PARTIAL" = 1 ] && idx_ok=0
 

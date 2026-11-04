@@ -173,3 +173,10 @@
 - [x] 真机实测：`sysupgrade -b` 生成的备份有 **37.7MB**，而引导分区 `/dev/sda1` 只剩 **9.8MB**。最大的文件来自 OpenClash 的 `/lib/upgrade/keep.d`，它保留了整个 `/etc/openclash/`：GeoIP.dat 18.5MB、clash_meta 13.2MB（`meta-backup` 里还有一份同样大小的）、GeoSite.dat 10.5MB、history 约 3MB。还原层的离线缓存只有约 1MB，不是主因。
 - [x] 修复：备份放不下时，先把 `SHRINK_PATHS`（默认是 OpenClash 的 core、GeoIP、GeoSite、Country/ASN.mmdb、history）用 `mv` 暂存到 `/root/.autosetup-hold`。它和 `/etc` 在同一个 overlay 上，只是改名，不占内存，也不在任何保留清单里。暂存后重新检查；仍然放不下，再移出离线缓存；还是放不下就中止，并把所有文件移回。owut 失败或上次中途被打断时，也会自动移回。首启还原完成后，会提示需要重新下载的文件。
 - [ ] 设备侧：这次恢复的 PVE 备份不含还原层，需要重新执行 `restore/install.sh`；升级前先拍一个 PVE 快照。
+
+## 十三、升级后自动切换清华源
+
+- [x] 升级会把 `distfeeds.list` 重置回 `downloads.openwrt.org`，之前还原时的官方包都是从国外服务器下载的。现在 restore 一开始就调用 `apply_mirror_files`（与 mirror 步骤共用）把官方源改写为清华镜像，然后再装包。
+- [x] 新版本刚发布时，镜像可能还没同步。如果索引刷新失败，或者不可用的源里有清华镜像，就调用 `revert_mirror_files`：只把清华地址换回官方域名，第三方源行不受影响。然后重新刷新索引，并提示镜像同步后再执行 `mirror`。
+- [x] `MIRROR_ON_RESTORE=0` 可以关闭这个行为。
+- [x] restore 时 apk 的安装输出不再丢弃，下载大依赖时也能从日志看到进度。

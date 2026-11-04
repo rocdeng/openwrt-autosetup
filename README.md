@@ -94,7 +94,7 @@ flowchart TD
     A[重启进入新固件] --> B["restore.flag 已在升级前预置（uci-defaults 也会再置一次）"]
     B --> C["procd 服务 autosetup 启动（服务文件与自启链接随 sysupgrade 保留）"]
     C --> D["等外网可达，最长 10 分钟"]
-    D --> E["补回 apk 签名公钥"]
+    D --> E["官方源换回清华镜像（镜像未同步时自动退回官方源），补回 apk 签名公钥"]
     E --> F["加回第三方源（跨分支时改写版本号 / 重跑 Nikki feed.sh）→ apk update"]
     F --> G["同分支：离线缓存优先装回；跨分支：跳过"]
     G --> H["按 sources.list 装回 GitHub 类包"]
