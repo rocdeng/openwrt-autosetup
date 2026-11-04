@@ -48,7 +48,7 @@ sh restore-install.sh
 1. 安装 `/etc/autosetup/setup.sh`（干活的主脚本；本目录没有 `setup.sh` 时会自动从仓库下载）
 2. 生成 `/etc/autosetup/sources.list`（仅登记"任何 feed 都没有"的包，如 GitHub Release）
 3. 安装 `/etc/init.d/autosetup` 并 enable（procd 服务，仅在有标记时干活）
-4. 生成 `/etc/owut.d/asu-defaults.sh`（随镜像下发的 uci-defaults，**只负责置标记，不含任何凭据**）
+4. 生成 `/etc/autosetup/asu-defaults.sh`（随镜像下发的 uci-defaults：置标记、重建服务并启动、重建短命令别名；**不含任何凭据**）
 5. 配置 `owut` 的 `init_script`
 6. 立即执行一次 `snapshot`
 
@@ -82,7 +82,7 @@ autosetup upgrade
 
 1. **快照**：已装包清单 → `pkgs.snapshot`；识别第三方包 → `thirdparty.list`；第三方源行 → `repos.snapshot`；签名公钥 → `keys/`；第三方包 apk → `apk-cache/`
 2. **剔除**：把 `thirdparty.list` 现算成 `owut upgrade -r <包名...>`
-3. **升级**：`owut upgrade -r ... -I /etc/owut.d/asu-defaults.sh --progress-size 1000`（构建 → 下载 → 校验 → 刷机 → 重启）
+3. **升级**：`owut upgrade -r ... -I /etc/autosetup/asu-defaults.sh --progress-size 1000`（构建 → 下载 → 校验 → 刷机 → 重启）
 
 升级期间会断网几分钟。镜像下载完开始刷机后**绝不可中断**。
 
@@ -144,7 +144,7 @@ ip route show default && nslookup www.baidu.com
 想进一步免手工，可用 cron 定期执行（**注意会自动重启路由器，建议放在凌晨并先手动验证一轮**）：
 
 ```sh
-echo '0 4 * * 6 /usr/bin/autosetup upgrade >> /etc/autosetup/cron.log 2>&1' >> /etc/crontabs/root
+echo '0 4 * * 6 /bin/sh /etc/autosetup/setup.sh upgrade >> /etc/autosetup/cron.log 2>&1' >> /etc/crontabs/root
 /etc/init.d/cron restart
 ```
 

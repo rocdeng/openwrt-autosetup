@@ -107,6 +107,7 @@ BOOT
 chmod 755 "$CONF/restore-boot.sh"
 
 # ---- 4. procd 服务：有标记才跑 ----
+mkdir -p /etc/init.d
 cat > /etc/init.d/autosetup <<'INITD'
 #!/bin/sh /etc/rc.common
 # 升级后有 restore.flag 时执行一次还原；无标记则什么都不做
@@ -133,25 +134,7 @@ chmod 755 /etc/init.d/autosetup
 cp -f /etc/init.d/autosetup "$CONF/init.d-autosetup"
 chmod 755 "$CONF/init.d-autosetup"
 
-# ---- 5. 随镜像下发的 uci-defaults：只负责置标记 ----
-cat > "$CONF/asu-defaults.sh" <<'DEFAULTS'
-#!/bin/sh
-# 由 owut --init-script 带入镜像，首启时执行；不要在此放置任何凭据
-# （该文件内容会上传构建服务器，并可从构建哈希公开下载）
-mkdir -p /etc/autosetup
-touch /etc/autosetup/restore.flag
-# 服务文件不在 sysupgrade 白名单，从保留目录的副本重建
-mkdir -p /etc/init.d
-if [ -f /etc/autosetup/init.d-autosetup ]; then
-    cp -f /etc/autosetup/init.d-autosetup /etc/init.d/autosetup
-    chmod 755 /etc/init.d/autosetup
-    /etc/init.d/autosetup enable 2>/dev/null
-fi
-# 短命令别名也在白名单外，每次首启重建
-ln -sf /etc/autosetup/setup.sh /usr/bin/autosetup 2>/dev/null
-exit 0
-DEFAULTS
-chmod 755 "$CONF/asu-defaults.sh"
+# ---- 5. uci-defaults 的路径由 setup.sh 生成（唯一来源），这里只登记 ----
 
 # 立刻建立一次别名，安装后即可用 `autosetup upgrade`
 ln -sf "$CONF/setup.sh" /usr/bin/autosetup 2>/dev/null
@@ -160,6 +143,7 @@ ln -sf "$CONF/setup.sh" /usr/bin/autosetup 2>/dev/null
 uci -q get attendedsysupgrade.owut >/dev/null 2>&1 || uci set attendedsysupgrade.owut=owut
 uci set attendedsysupgrade.owut.init_script="$CONF/asu-defaults.sh"
 rm -f "$OWUT_D/asu-defaults.sh"   # 旧位置不在白名单，弃用
+rm -f "$CONF/asu-defaults.sh"     # 由 setup.sh snapshot 重新生成，避免两份实现漂移
 # 不用 pre_install：owut 经 ubus file exec 调用且有超时，快照由 upgrade 步骤自己完成
 uci -q delete attendedsysupgrade.owut.pre_install
 rm -f "$CONF/pre-install.sh"

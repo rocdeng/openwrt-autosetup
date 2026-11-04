@@ -936,6 +936,7 @@ step_snapshot() {
     fi
     snapshot_extra_repos
     snapshot_apk_keys
+    ensure_restore_files
 }
 
 # 按 sources.list 重装无法从 feed 取得的包（GitHub Release 等）
@@ -1028,24 +1029,26 @@ step_restore() {
 ensure_restore_files() {
     mkdir -p "$CONF_DIR" 2>/dev/null
 
-    if [ ! -f "$OWUT_INIT" ]; then
-        cat > "$OWUT_INIT" <<'EOS'
-#!/bin/sh
+    # 生成物：每次按当前逻辑重写，避免与安装器里的副本漂移
+    if printf '%s\n' '#!/bin/sh
 # 由 owut --init-script 带入镜像，首启执行；不要在此放置任何凭据
 # （内容会上传构建服务器，并可从构建哈希公开下载）
 mkdir -p /etc/autosetup
 touch /etc/autosetup/restore.flag
 # 服务文件本身不在 sysupgrade 白名单，从 /etc/autosetup 的副本重建
 if [ -f /etc/autosetup/init.d-autosetup ]; then
+    mkdir -p /etc/init.d
     cp -f /etc/autosetup/init.d-autosetup /etc/init.d/autosetup
     chmod 755 /etc/init.d/autosetup
     /etc/init.d/autosetup enable 2>/dev/null
+    # uci-defaults 在 rcS 之前运行，这里直接启动，不依赖服务启动顺序
+    /etc/init.d/autosetup start 2>/dev/null
 fi
 ln -sf /etc/autosetup/setup.sh /usr/bin/autosetup 2>/dev/null
-exit 0
-EOS
+exit 0' > "$OWUT_INIT" 2>/dev/null; then
         chmod 755 "$OWUT_INIT"
-        info "已重建 $OWUT_INIT"
+    else
+        warn "写入 $OWUT_INIT 失败"
     fi
 
     if [ ! -f /etc/init.d/autosetup ]; then
@@ -1060,6 +1063,19 @@ EOS
             fi
         else
             warn "缺少服务文件 /etc/init.d/autosetup，升级后无法自动还原"
+        fi
+    fi
+
+    # 短命令别名，同样不在白名单
+    ln -sf "$CONF_DIR/setup.sh" /usr/bin/autosetup 2>/dev/null
+
+    # 旧安装可能仍指向 /etc/owut.d，规范到保留目录
+    if command -v uci >/dev/null 2>&1 && uci -q get attendedsysupgrade.owut >/dev/null 2>&1; then
+        cur=$(uci -q get attendedsysupgrade.owut.init_script 2>/dev/null)
+        if [ "$cur" != "$OWUT_INIT" ]; then
+            uci set attendedsysupgrade.owut.init_script="$OWUT_INIT" 2>/dev/null \
+                && uci commit attendedsysupgrade 2>/dev/null \
+                && info "已把 owut init_script 规范为 $OWUT_INIT"
         fi
     fi
 }
