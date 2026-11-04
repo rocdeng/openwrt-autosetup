@@ -139,9 +139,14 @@ cat > "$OWUT_D/asu-defaults.sh" <<'DEFAULTS'
 mkdir -p /etc/autosetup
 touch /etc/autosetup/restore.flag
 /etc/init.d/autosetup enable 2>/dev/null
+# 短命令别名放在 /usr（不在 sysupgrade 白名单），每次首启重建
+ln -sf /etc/autosetup/setup.sh /usr/bin/autosetup 2>/dev/null
 exit 0
 DEFAULTS
 chmod 755 "$OWUT_D/asu-defaults.sh"
+
+# 立刻建立一次别名，安装后即可用 `autosetup upgrade`
+ln -sf "$CONF/setup.sh" /usr/bin/autosetup 2>/dev/null
 
 # ---- 6. 配置 owut：只挂两个钩子（剔除名单由 setup.sh 每次升级前自动生成）----
 uci -q get attendedsysupgrade.owut >/dev/null 2>&1 || uci set attendedsysupgrade.owut=owut

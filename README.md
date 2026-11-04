@@ -73,8 +73,10 @@ cat /etc/autosetup/thirdparty.list      # 自动识别出的第三方包
 ## 4. 日常升级：一条命令
 
 ```sh
-sh /etc/autosetup/setup.sh upgrade
+autosetup upgrade
 ```
+
+（安装器会建立 `/usr/bin/autosetup` 软链；该路径不在 sysupgrade 白名单，每次升级后由 uci-defaults 重建。等效写法 `sh /etc/autosetup/setup.sh upgrade`。）
 
 内部顺序：
 
@@ -126,6 +128,27 @@ cat /etc/autosetup/restore.log
 apk info -e nikki luci-app-nikki            # 第三方包是否回来了
 ip route show default && nslookup www.baidu.com
 ```
+
+## 6.5 手工操作清单（全生命周期只有 3 处）
+
+| # | 时机 | 操作 | 频率 |
+|---|---|---|---|
+| 1 | 首次部署 | `wget` + `sh restore-install.sh` | 一次 |
+| 2 | 每次升级 | `autosetup upgrade` | 每次 |
+| 3 | 升级后 | OpenClash 页面重新下载 mihomo 内核 | 每次（无 feed 可选，唯一无法自动化项） |
+
+除此之外全自动：快照、识别第三方包、缓存 apk、备份公钥与源、剔除构建清单、生成还原标记、开机等待网络、补公钥、回放源、离线装回、在线补齐、写日志。
+
+### 可选：定时自动升级（默认关闭）
+
+想进一步免手工，可用 cron 定期执行（**注意会自动重启路由器，建议放在凌晨并先手动验证一轮**）：
+
+```sh
+echo '0 4 * * 6 /usr/bin/autosetup upgrade >> /etc/autosetup/cron.log 2>&1' >> /etc/crontabs/root
+/etc/init.d/cron restart
+```
+
+风险：升级期间断网数分钟；若新版固件配置不兼容（`sysupgrade -n`），静态 IP 会丢，还原层无法联网。仅在你接受"周末凌晨自动重启"时启用；删除对应 crontab 行并 `restart cron` 即可关闭。
 
 ## 7. 已知边界
 
@@ -181,8 +204,14 @@ sh /etc/autosetup/setup.sh restore
 # 重新跑 Nikki 源（重装公钥+源+包）
 sh /etc/autosetup/setup.sh nikki
 
+# 短命令（等同 sh /etc/autosetup/setup.sh）
+autosetup netcheck
+autosetup snapshot
+autosetup restore
+
 # 更新脚本本身
 wget -O /etc/autosetup/setup.sh https://raw.githubusercontent.com/rocdeng/openwrt-autosetup/main/setup.sh
+ln -sf /etc/autosetup/setup.sh /usr/bin/autosetup
 
 # 指定上级网关 / DNS
 sh /etc/autosetup/setup.sh netcheck --gateway 192.168.1.1 --dns 223.5.5.5
