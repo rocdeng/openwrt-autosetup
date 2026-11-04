@@ -167,3 +167,9 @@
 - [x] 最可能的原因（待设备证据确认）：在 x86 上，sysupgrade 写完镜像后，`platform_copy_config` 会把配置备份 `cp` 到引导分区（默认只有 16MB，内核已经占去大半），而且**不检查 cp 的返回值**。备份放不下时，升级照常完成，首次启动找不到备份，全部配置被静默丢弃。`/etc/autosetup/apk-cache`（含 nikki/mihomo 二进制）、`github-cache` 以及 OpenClash 的大文件都会撑大备份。
 - [x] 修复：`upgrade` 在调用 owut 前先 `sysupgrade -b` 生成一次真实备份，和 `/boot` 的剩余空间比较（留 2MB 余量）。放不下时，先把离线缓存移出备份再检查；仍然放不下就中止升级，并列出备份中最大的文件。owut 失败时会把缓存移回原处。
 - [ ] 设备侧：确认引导分区大小与剩余空间、检查有没有残留的 `sysupgrade.tgz`，并恢复配置。
+
+### 十二（续）：原因已确认
+
+- [x] 真机实测：`sysupgrade -b` 生成的备份有 **37.7MB**，而引导分区 `/dev/sda1` 只剩 **9.8MB**。最大的文件来自 OpenClash 的 `/lib/upgrade/keep.d`，它保留了整个 `/etc/openclash/`：GeoIP.dat 18.5MB、clash_meta 13.2MB（`meta-backup` 里还有一份同样大小的）、GeoSite.dat 10.5MB、history 约 3MB。还原层的离线缓存只有约 1MB，不是主因。
+- [x] 修复：备份放不下时，先把 `SHRINK_PATHS`（默认是 OpenClash 的 core、GeoIP、GeoSite、Country/ASN.mmdb、history）用 `mv` 暂存到 `/root/.autosetup-hold`。它和 `/etc` 在同一个 overlay 上，只是改名，不占内存，也不在任何保留清单里。暂存后重新检查；仍然放不下，再移出离线缓存；还是放不下就中止，并把所有文件移回。owut 失败或上次中途被打断时，也会自动移回。首启还原完成后，会提示需要重新下载的文件。
+- [ ] 设备侧：这次恢复的 PVE 备份不含还原层，需要重新执行 `restore/install.sh`；升级前先拍一个 PVE 快照。

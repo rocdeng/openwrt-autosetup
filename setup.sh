@@ -1342,6 +1342,11 @@ step_restore() {
     fi
     rm -f "$ATTEMPTS_FILE"
     info "恢复完成：本次补装 $restored 个包"
+    if [ -s "$SHRUNK_NOTE" ]; then
+        warn "升级时为缩小配置备份移除了以下文件，请在对应插件中重新下载（如 OpenClash「版本更新」/ GEO 数据库更新）:"
+        sed 's/^/    /' "$SHRUNK_NOTE" | tee -a "$LOG_FILE"
+        rm -f "$SHRUNK_NOTE"
+    fi
 }
 
 # 服务与 init-script 都不在 sysupgrade 白名单里，升级后会消失；
@@ -1406,10 +1411,21 @@ exit 0' > "$OWUT_INIT" 2>/dev/null; then
 
 # ---- 配置备份体积守卫 ----
 # x86 等平台：sysupgrade 刷完镜像后，由 platform_copy_config 把配置备份
-# cp 到引导分区（默认仅 16MB，内核已占去大半）。空间不够时 cp 失败，
+# cp 到引导分区（默认仅 16MB，内核已占去约 6MB）。空间不够时 cp 失败，
 # 但脚本不检查返回值——升级照常完成，首启找不到备份，全部配置静默丢失。
-# 因此刷机前先生成一次真实备份，和引导分区剩余空间比较。
-MOVED_CACHE_DIR=""
+# 真机实测：OpenClash 的 keep.d 保留整个 /etc/openclash/（内核 ×2、GeoIP、GeoSite），
+# 备份 37MB，引导分区只剩 9.8MB。
+# 因此刷机前先生成一次真实备份，和引导分区剩余空间比较；放不下时，
+# 先把可重新下载的大文件暂存到备份范围之外，仍放不下就中止。
+
+# 可重新下载的大文件（升级后需在对应插件里重新下载），空格分隔，可用环境变量覆盖
+SHRINK_PATHS="${SHRINK_PATHS:-/etc/openclash/core /etc/openclash/GeoIP.dat /etc/openclash/GeoSite.dat /etc/openclash/Country.mmdb /etc/openclash/ASN.mmdb /etc/openclash/history}"
+# 暂存目录：与 /etc 同在 overlay 上（mv 只是改名，不占内存），且不在任何保留清单里。
+# 刷机成功后随旧系统一起消失；升级失败则原样移回
+HOLD_DIR="/root/.autosetup-hold"
+HOLD_LIST="$HOLD_DIR/.list"
+# 记录本次被暂存（升级后需重新下载）的路径，随 /etc/autosetup 保留，供首启提示
+SHRUNK_NOTE="$CONF_DIR/shrunk.list"
 
 # 返回 0=放得下 1=放不下 2=无法判断；结果放入 BACKUP_KB / BOOT_AVAIL_KB
 check_backup_fits() {
@@ -1418,8 +1434,8 @@ check_backup_fits() {
     rm -f "$bk"
     sysupgrade -b "$bk" >/dev/null 2>&1 || { rm -f "$bk"; return 2; }
     BACKUP_KB=$(( ($(wc -c < "$bk") + 1023) / 1024 ))
-    # 体积最大的几个文件，便于定位
-    tar -tzvf "$bk" 2>/dev/null | awk '{ print $3, $NF }' | sort -rn | head -n 5 \
+    # 体积最大的几个文件（字节数 路径），便于定位
+    tar -tzvf "$bk" 2>/dev/null | awk '{ print $3, $NF }' | sort -rn | head -n 8 \
         > "$TMP_DIR/backup-top.txt"
     rm -f "$bk"
     # 只有单独挂载引导分区的平台（x86 等）有此限制
@@ -1431,16 +1447,32 @@ check_backup_fits() {
     return 1
 }
 
-restore_moved_caches() {
-    [ -n "$MOVED_CACHE_DIR" ] && [ -d "$MOVED_CACHE_DIR" ] || return 0
-    for d in "$MOVED_CACHE_DIR"/*; do
-        [ -e "$d" ] && mv "$d" "$CONF_DIR/" 2>/dev/null
-    done
-    rm -rf "$MOVED_CACHE_DIR"
-    MOVED_CACHE_DIR=""
+# 把一个路径暂存到 HOLD_DIR（保留原有目录层级），并登记
+hold_path() {
+    [ -e "$1" ] || return 0
+    mkdir -p "$HOLD_DIR$(dirname "$1")" || return 1
+    mv "$1" "$HOLD_DIR$1" || return 1
+    printf '%s\n' "$1" >> "$HOLD_LIST"
+}
+
+# 把暂存的路径全部移回原处（升级失败、或上次异常中断时调用）
+release_held() {
+    [ -f "$HOLD_LIST" ] || { rm -rf "$HOLD_DIR"; return 0; }
+    while read -r p; do
+        [ -n "$p" ] && [ -e "$HOLD_DIR$p" ] || continue
+        mkdir -p "$(dirname "$p")"
+        rm -rf "$p"
+        mv "$HOLD_DIR$p" "$p" && info "已移回: $p"
+    done < "$HOLD_LIST"
+    rm -rf "$HOLD_DIR"
+    rm -f "$SHRUNK_NOTE"
 }
 
 guard_backup_size() {
+    # 上次升级若在中途被打断，先把暂存的文件放回去
+    [ -d "$HOLD_DIR" ] && release_held
+    rm -f "$SHRUNK_NOTE"
+
     check_backup_fits
     fit=$?
     if [ "$fit" = 2 ]; then
@@ -1457,25 +1489,48 @@ guard_backup_size() {
     fi
 
     warn "配置备份 ${BACKUP_KB}KB，引导分区仅剩 ${BOOT_AVAIL_KB}KB：直接升级会丢失全部配置"
-    # 先牺牲离线缓存：升级后改为在线还原，配置比版本锁定重要得多
+
+    # 第 1 步：暂存可重新下载的大文件（内核、Geo 数据库、历史记录）
+    if [ "${SHRINK_BACKUP:-1}" = "1" ]; then
+        mkdir -p "$HOLD_DIR"
+        : > "$HOLD_LIST"
+        for p in $SHRINK_PATHS; do
+            hold_path "$p" || warn "暂存失败: $p"
+        done
+        if [ -s "$HOLD_LIST" ]; then
+            cp -f "$HOLD_LIST" "$SHRUNK_NOTE" 2>/dev/null
+            warn "已把以下可重新下载的文件移出备份（升级后需在插件中重新下载）:"
+            sed 's/^/    /' "$HOLD_LIST" | tee -a "$LOG_FILE"
+            check_backup_fits
+            fit=$?
+            if [ "$fit" = 0 ]; then
+                info "移出后备份 ${BACKUP_KB}KB，引导分区剩余 ${BOOT_AVAIL_KB}KB，空间足够"
+                return 0
+            fi
+        fi
+    fi
+
+    # 第 2 步：再牺牲离线缓存（升级后改为在线还原）
     if [ -d "$APK_CACHE" ] || [ -d "$GH_CACHE" ]; then
-        MOVED_CACHE_DIR="$TMP_DIR/moved-cache"
-        rm -rf "$MOVED_CACHE_DIR"; mkdir -p "$MOVED_CACHE_DIR"
-        [ -d "$APK_CACHE" ] && mv "$APK_CACHE" "$MOVED_CACHE_DIR/"
-        [ -d "$GH_CACHE" ] && mv "$GH_CACHE" "$MOVED_CACHE_DIR/"
+        mkdir -p "$HOLD_DIR"
+        [ -f "$HOLD_LIST" ] || : > "$HOLD_LIST"
+        hold_path "$APK_CACHE"
+        hold_path "$GH_CACHE"
         warn "已将离线缓存移出备份（本次升级后改为在线还原），重新检查"
         check_backup_fits
         fit=$?
         if [ "$fit" = 0 ]; then
-            info "移出离线缓存后备份 ${BACKUP_KB}KB，空间足够"
+            info "移出后备份 ${BACKUP_KB}KB，引导分区剩余 ${BOOT_AVAIL_KB}KB，空间足够"
             return 0
         fi
     fi
-    restore_moved_caches
-    err "配置备份 ${BACKUP_KB}KB 仍超过引导分区剩余空间 ${BOOT_AVAIL_KB}KB，已中止升级"
-    info "备份中最大的文件（KB 前为字节数）:"
-    cat "$TMP_DIR/backup-top.txt" 2>/dev/null | tee -a "$LOG_FILE"
-    info "请把大文件移出 /etc 或从 /etc/sysupgrade.conf 删除对应条目后重试"
+
+    release_held
+    err "配置备份 ${BACKUP_KB}KB 仍超过引导分区剩余空间 ${BOOT_AVAIL_KB}KB（需留 2MB 余量），已中止升级"
+    info "备份中最大的文件（字节数 路径）:"
+    sed 's/^/    /' "$TMP_DIR/backup-top.txt" 2>/dev/null | tee -a "$LOG_FILE"
+    info "可把其中可重新下载的路径加入 SHRINK_PATHS 后重试，例如:"
+    info "  SHRINK_PATHS=\"$SHRINK_PATHS /etc/xxx/大文件\" sh $0 upgrade"
     return 1
 }
 
@@ -1547,7 +1602,7 @@ step_upgrade() {
     log "执行: owut $*"
     owut "$@" || {
         rm -f "$RESTORE_FLAG"
-        restore_moved_caches
+        release_held
         err "owut 升级失败（未刷机，已撤销还原标记）"
         record_fail "upgrade"
         return 1

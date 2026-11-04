@@ -164,7 +164,7 @@ echo '0 4 * * 6 /bin/sh /etc/autosetup/setup.sh upgrade >> /etc/autosetup/cron.l
 | `-I` 上传的脚本 | 内容会发到构建服务器，可从构建哈希公开下载 | 该文件只置标记、不含凭据，切勿往里放密码 |
 | 官方镜像构建时长 | ASU 排队+构建通常 2–5 分钟 | 正常现象 |
 | OpenClash 内核可选保留 | `/etc/openclash/core/` 加进 `/etc/sysupgrade.conf` 即可跨升级保留，省掉手工下载 | 内核常 50–100MB，会打进内存中的备份包；小内存别加，建议维持手工下载 |
-| 备份体积 | `/etc/autosetup` 会整体进 sysupgrade 备份包，而该包在 `/tmp`（内存）中生成 | 小内存设备（64–128MB）若第三方包很多，可先 `du -sh /etc/autosetup` 确认；必要时删 `apk-cache/` 只保留在线还原 |
+| 备份体积 | **x86 上配置备份要放进约 16MB 的引导分区**（内核已占约 6MB）；放不下时 sysupgrade 不报错、配置全部丢失（实测：OpenClash 的内核与 Geo 数据让备份达 37MB） | `upgrade` 刷机前会实测备份大小：放不下时先把 `SHRINK_PATHS`（默认 OpenClash 内核、GeoIP/GeoSite、history）暂存到 `/root/.autosetup-hold`，再移出离线缓存，仍放不下则中止。升级后需在 OpenClash 里重新下载内核与 Geo 数据库；`SHRINK_BACKUP=0` 关闭暂存 |
 
 ## 8. 故障排查（都是实测踩过的）
 
