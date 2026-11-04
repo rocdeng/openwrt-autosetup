@@ -153,3 +153,10 @@
 - [x] Argon 3.x 把配置工具的文件（`/etc/config/argon`、rpcd、菜单、ACL、`argon-config.js`）并进了主题包，`luci-app-argon-config` 3.x 只剩一个 848 字节的空壳。旧版本是先单独升级主题，这时文件仍归旧的 `luci-app-argon-config` 1.0 所有，于是报 `trying to overwrite ... owned by`。
 - [x] 修复：`github_install` 支持同一仓库传入多个包，所有 apk 放进同一个 `apk add` 事务，由 apk 处理文件归属的转移。`step_argon` 和 `restore_sources`（按仓库分组）都改为一次性安装。离线还原本来就是同一个事务，不受影响。
 - [ ] 设备侧：主题包处于"1 error"状态，需要用新脚本 `FORCE=1 sh /etc/autosetup/setup.sh argon` 重装一次，或者执行 `apk fix luci-theme-argon`。
+
+## 十一、第七轮：`autosetup upgrade` 被 ASU 拒绝
+
+- [x] 现象：`Status: Repository not allowed: https://nikkinikki.pages.dev/...`，构建返回 400。
+- [x] 原因：新版 owut 的 `--repositories-mode` 默认是 `append`，会把 `/etc/apk/repositories.d/` 下除 `distfeeds.list` 外所有文件里的源（这里是 `customfeeds.list` 中的 Nikki 源）连同 `/etc/apk/keys` 一起提交给 ASU。官方服务器不允许任何外部源。
+- [x] 修复：owut 支持该参数时，自动追加 `--repositories-mode disable`。第三方包本来就已经用 `-r` 剔除，升级后由还原层装回。
+- [ ] 待观察：同次输出里的 `404 ... releases/25.12.6/targets/x86/64/kmods/6.12.71-.../index.json` 是 owut 用旧内核的 kmods 路径去查新版本，看起来不影响构建（随后正常打印了版本对比），修复后再确认一次。

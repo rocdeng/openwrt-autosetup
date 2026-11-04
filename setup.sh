@@ -1458,6 +1458,13 @@ step_upgrade() {
     case "$owut_help" in
         *--progress-size*) set -- "$@" --progress-size "${OWUT_PROGRESS_SIZE:-1000}" ;;
     esac
+    # 新版 owut 默认（append）会把 /etc/apk/repositories.d/ 下除 distfeeds.list 外的源
+    # 一并提交给 ASU；官方服务器的 repository_allow_list 为空，直接报
+    # "Repository not allowed" 拒绝构建。第三方包已剔除、升级后由还原层装回，
+    # 因此关闭这一行为，只用官方源构建
+    case "$owut_help" in
+        *--repositories-mode*) set -- "$@" --repositories-mode disable ;;
+    esac
 
     log "执行: owut $*"
     owut "$@" || {
