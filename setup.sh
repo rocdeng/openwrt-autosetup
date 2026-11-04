@@ -796,14 +796,20 @@ thirdparty_packages() {
         printf '未找到任何官方源行（检查 /etc/apk/repositories）\n' > "$TMP_DIR/official.err"
         return 1
     }
+    # 先用官方源单独刷一次索引，避免用残缺的缓存索引做比对
+    apk --repositories-file "$TMP_DIR/official.repos" update >/dev/null 2>&1
     if ! apk --repositories-file "$TMP_DIR/official.repos" list -a \
             > "$TMP_DIR/official.pkgs" 2> "$TMP_DIR/official.err"; then
         return 1
     fi
-    [ -s "$TMP_DIR/official.pkgs" ] || {
-        printf '官方源索引为空（索引未下载，可先执行 apk update）\n' > "$TMP_DIR/official.err"
+    n_official=$(wc -l < "$TMP_DIR/official.pkgs" 2>/dev/null | tr -d ' ')
+    if [ -z "$n_official" ] || [ "$n_official" -lt 200 ]; then
+        printf '官方源索引不可信（仅 %s 条），可能部分 feed 未取到\n' "${n_official:-0}" \
+            > "$TMP_DIR/official.err"
         return 1
-    }
+    fi
+    # 注意：本函数的 stdout 会被 $(...) 捕获，诊断信息必须走 stderr
+    printf '[信息] 官方源可用包 %s 个（用于比对）\n' "$n_official" >&2
     list_installed | sort -u > "$TMP_DIR/installed.txt"
     awk '
         NR == FNR { want[$0] = 1; next }
@@ -898,8 +904,15 @@ cache_thirdparty_apks() {
     mkdir -p "$staging" || return 1
     # 先把旧缓存搬进 staging：本次下载失败的包仍保留上次的副本
     [ -d "$APK_CACHE" ] && cp -f "$APK_CACHE"/*.apk "$staging"/ 2>/dev/null
-    apk fetch -o "$staging" $(cat "$THIRD_LIST") >/dev/null 2>&1
+    # 逐包 fetch：批量时只要有一个包不可用，整条命令就会失败、一个都下不到
+    failed=""
+    for p in $(cat "$THIRD_LIST"); do
+        if ! apk fetch -o "$staging" "$p" >/dev/null 2>&1; then
+            failed="$failed $p"
+        fi
+    done
     got=$(ls "$staging"/*.apk 2>/dev/null | wc -l | tr -d ' ')
+    [ -n "$failed" ] && log "以下包源里取不到（无法离线备份）:$failed"
     rm -rf "$APK_CACHE"
     mv "$staging" "$APK_CACHE"
     info "已离线备份 $got 个第三方包 -> $APK_CACHE"
